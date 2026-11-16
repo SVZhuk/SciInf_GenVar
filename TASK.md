@@ -9,10 +9,15 @@ sections as part of this task.
 
 ### 1. Project setup
 1.1 Initialize a Git repository on GitHub.
+
 1.2 Set up the project structure: API route handlers, services, models, schemas, database session.
+
 1.3 Set up a virtual environment using Poetry.
+
 1.4 Install core dependencies and create a base FastAPI application.
+
 1.5 Set up Docker and Docker Compose for local development.
+
 1.6 Write a `README.md` with setup instructions.
 
 ### 2. CI pipeline
@@ -34,8 +39,11 @@ annotation files and variant annotations: at least `projects`, `vcf_files`, `var
 are added in later weeks.
 
 4.3 Connect the project endpoints to PostgreSQL through the SQLAlchemy async ORM.
+
 4.4 Create SQLAlchemy models matching the schema.
+
 4.5 Create Pydantic schemas for request and response validation.
+
 4.6 (Optional) Set up Alembic for database migrations.
 
 ## The `projects` table
@@ -80,6 +88,122 @@ Naming conventions are in [ARCHITECTURE.md](ARCHITECTURE.md#6-data-model) sectio
   so tests do not affect each other.
 - Do not mock the database session: mocked SQLAlchemy calls test the mock, not your SQL.
 - The 80% coverage is measured over the whole suite.
+
+## Week 1 milestone checklist
+
+Work through it in order and tick items off. Items marked **(decision)** are architectural choices:
+record each one, with its reason, in the `ARCHITECTURE.md` decision log.
+
+### Repository and tooling
+- [ ] GitHub repository created; default branch `main`.
+- [ ] `.gitignore` written **before the first commit** (virtual environment, `.env`, caches,
+      coverage files). A secret committed once stays in the history.
+- [ ] One branch per piece of work, merged through a pull request so CI checks it.
+- [ ] Poetry project with an in-project `.venv`; `poetry.lock` committed; runtime and dev
+      dependencies in separate groups.
+- [ ] Python version pinned in one place and the same locally, in Docker and in CI.
+- [ ] ruff (lint + format) and mypy configured in `pyproject.toml`.
+
+### Structure and architecture
+- [ ] **(decision)** Layers with one job each, dependencies pointing one way only:
+      route handlers, then services, then storage access. Route handlers never touch the database;
+      services and storage code never import FastAPI.
+- [ ] Separate packages or modules for route handlers, services, storage access, SQLAlchemy models,
+      Pydantic schemas, the database session, and configuration.
+- [ ] **(decision)** Storage behind an interface (for example a `typing.Protocol`) with two
+      implementations: one for Postgres and one in memory. Services depend on the interface,
+      not on SQLAlchemy.
+- [ ] **(decision)** Dependency injection: FastAPI `Depends` providers wired in one module; that
+      module is the only place that picks concrete implementations.
+- [ ] **(decision)** Domain errors (for example "project not found", "name already exists") are
+      plain Python exceptions raised in services or storage code, and turned into HTTP status
+      codes only in route handlers.
+- [ ] **(decision)** An application factory (a function that builds the FastAPI app), so tests get
+      a fresh, explicitly configured app with no side effects at import time.
+
+### Configuration and logging
+- [ ] All settings come from environment variables through pydantic-settings; `.env` is
+      git-ignored and `.env.example` is committed.
+- [ ] The database URL is held as a secret type (`SecretStr`) so it cannot leak through logs or
+      tracebacks.
+- [ ] Logging configured once at startup; one logger per module.
+- [ ] One log line per request: method, path, status code, duration. 4xx at WARNING, 5xx at ERROR.
+- [ ] State changes logged at INFO with ids (project created, project deleted); rejected
+      requests at WARNING.
+- [ ] Nothing sensitive in logs: no request bodies, query strings, database URLs or credentials.
+
+### Database
+- [ ] ER diagram for all five tables in `ARCHITECTURE.md` section 6: primary keys, foreign keys,
+      relationships, main columns and types.
+- [ ] **(decision)** Key types: UUIDs for resources clients address directly; consider `bigint`
+      for very large tables such as `variants`. Explain your choice.
+- [ ] **(decision)** Where uploaded file contents live (database or object storage) and what happens
+      to child rows when a project is deleted.
+- [ ] A constraint naming convention set on the SQLAlchemy metadata, so every constraint has a
+      predictable name.
+- [ ] `projects` model exactly as in the table above; nullability follows the type hints.
+- [ ] **(decision)** Name uniqueness enforced by a database unique constraint, not by a "check,
+      then insert" query, which races under concurrent requests. The constraint violation is
+      turned into a domain error.
+- [ ] One database session (one transaction) per request: commit on success, roll back on any
+      error.
+- [ ] Alembic initialised with the async template; the database URL comes from your settings, not
+      from `alembic.ini`.
+- [ ] First migration generated, **read by hand**, and checked: `upgrade head`, `downgrade base`,
+      `upgrade head` all work. The schema changes only through migrations.
+
+### API
+- [ ] Separate Pydantic models for input (create) and output (read); clients cannot send
+      server-owned fields (`project_id`, `created_at`, `completed_at`).
+- [ ] Input validation in the schema: strings stripped, length limits, required fields.
+- [ ] `POST /projects/` returns 201 with the created project; 409 on a duplicate name; 422 on
+      invalid input.
+- [ ] `GET /projects/` returns 200 with a list in a stable order (oldest first).
+- [ ] `DELETE /projects/{project_id}/` returns 204 with an empty body; 404 for an unknown id;
+      422 for an id that is not a UUID.
+- [ ] Every route declares its `status_code` and `response_model`.
+- [ ] `GET /health` returns 200 (used by the Docker health check).
+- [ ] **(decision)** Whether to add a version prefix such as `/api/v1`. If you do, say so in the
+      README.
+
+### Docker
+- [ ] Multi-stage `Dockerfile`: dependencies installed in a builder stage, slim runtime image,
+      runs as a non-root user, health check.
+- [ ] `.dockerignore` keeps `.env`, `.git`, tests and caches out of the image.
+- [ ] Compose services: the API, a Postgres database with a health check and a named volume, a
+      one-off migration step that runs before the API starts, and a separate test database.
+- [ ] Database ports bound to `127.0.0.1` only.
+- [ ] `docker compose up --build` from a fresh clone gives a working API.
+
+### Tests
+- [ ] Unit tests for schemas, the in-memory storage and services (no database).
+- [ ] API tests through the real app with an in-process HTTP client (httpx `ASGITransport`) and
+      storage swapped via `app.dependency_overrides`.
+- [ ] Integration tests for the Postgres storage against the test database, each test rolled back.
+- [ ] Every endpoint: a happy-path test plus one test per documented error status.
+- [ ] Logging checked in at least one test (pytest `caplog`).
+- [ ] Line coverage at least 80% over the whole suite, enforced by the coverage configuration.
+
+### CI and pre-commit
+- [ ] `.pre-commit-config.yaml` with ruff (check and format), trailing whitespace and
+      end-of-file fixer; installed locally with `pre-commit install`.
+- [ ] GitHub Actions workflow on every push and every pull request.
+- [ ] Separate, named steps for linting, formatting and tests, so a failure shows which stage broke.
+      Reuse the pre-commit hooks in CI so local and CI checks cannot drift.
+- [ ] Tests in CI run against a Postgres service container; migrations are applied in CI.
+- [ ] Workflow token permissions limited to what it needs (`contents: read`).
+
+### Documentation
+- [ ] `README.md`: what the project is, requirements, Docker quick start, local development,
+      running tests, migrations, the endpoint table.
+- [ ] `ARCHITECTURE.md` sections 3 to 7, 8 (configuration and CI) and 9 filled in.
+- [ ] `ARCHITECTURE.md` changelog entry for week 1.
+
+### Final check before submitting
+- [ ] Fresh clone, then `docker compose up --build`: all three endpoints work.
+- [ ] Tests, linting, formatting and type checks pass locally.
+- [ ] CI is green on `main`.
+- [ ] No `.env` or credentials anywhere in the git history.
 
 ## Submission
 
