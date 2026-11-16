@@ -1,0 +1,113 @@
+{
+  "env": {
+    "BASH_MAX_OUTPUT_LENGTH": "8000"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(poetry install:*)",
+      "Bash(poetry check:*)",
+      "Bash(poetry show:*)",
+      "Bash(poetry run python scripts/check.py:*)",
+      "Bash(poetry run pytest:*)",
+      "Bash(poetry run ruff:*)",
+      "Bash(poetry run mypy:*)",
+      "Bash(poetry run pyright:*)",
+      "Bash(poetry run uvicorn:*)",
+      "Bash(poetry run alembic:*)",
+      "Bash(poetry run pre-commit:*)",
+      "Bash(docker compose:*)",
+      "Bash(git diff:*)",
+      "Bash(git status:*)",
+      "Bash(terraform fmt:*)",
+      "Bash(terraform init:*)",
+      "Bash(terraform validate:*)",
+      "Bash(terraform test:*)"
+    ],
+    "deny": [
+      "Read(./.venv/**)",
+      "Read(./.ruff_cache/**)",
+      "Read(./.mypy_cache/**)",
+      "Read(./**/__pycache__/**)",
+      "Read(./.pytest_cache/**)",
+      "Read(./.env)",
+      "Read(./**/*.tfstate*)",
+      "Read(./**/*.tfvars)",
+      "Read(./**/*.pem)",
+      "Read(~/.aws/**)",
+      "Read(~/.ssh/**)",
+      "Edit(./poetry.lock)",
+      "Write(./poetry.lock)",
+      "Edit(./.venv/**)",
+      "Write(./.venv/**)"
+    ],
+    "ask": ["Edit(./tests/**)", "Write(./tests/**)"]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && { [ ! -f pyproject.toml ] || poetry install --quiet; }",
+            "timeout": 180
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && python3 .claude/hooks/poetry_guard.py",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit|Grep|Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && python3 .claude/hooks/secret_guard.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && { [ ! -f pyproject.toml ] || { poetry run ruff format -q . && poetry run ruff check --fix -q --output-format concise . 1>&2; } || exit 2; }",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && { [ ! -f pyproject.toml ] || [ ! -d app ] || poetry run pyright app 1>&2 || exit 2; }",
+            "timeout": 60
+          },
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && python3 .claude/hooks/dash_guard.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && python3 .claude/hooks/stop_check.py",
+            "timeout": 180
+          }
+        ]
+      }
+    ]
+  }
+}
