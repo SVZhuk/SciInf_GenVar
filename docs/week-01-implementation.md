@@ -24,12 +24,12 @@ step, and commit once the step works.
 | 4.3 Endpoints on PostgreSQL via SQLAlchemy async ORM | Steps 5 to 7 |
 | 4.4 SQLAlchemy models | Step 5 |
 | 4.5 Pydantic request/response schemas | Step 5 |
-| 4.6 Alembic migrations (optional, done) | Step 8 |
+| 4.6 Alembic migrations (optional, done) | Steps 8 to 9 |
 | Beyond the brief: logging, 80% coverage gate, mypy | Steps 4, 10, 12 |
 
 ## Definition of done
 
-- [ ] `poetry init` sets up `.venv/` from `poetry.lock`
+- [ ] `poetry install` sets up `.venv/` from `poetry.lock`
 - [ ] `docker compose up --build` starts db, runs migrations, serves the API on :8000
 - [ ] `POST /api/v1/projects/`, `GET /api/v1/projects/`, `DELETE /api/v1/projects/{project_id}/` work
 - [ ] `alembic upgrade head` and `alembic downgrade base` both run cleanly
@@ -658,7 +658,16 @@ from app.schemas.project import ProjectCreate
 
 logger = logging.getLogger(__name__)
 
+UNIQUE_VIOLATION_SQLSTATE = "23505"
 UNIQUE_NAME_CONSTRAINT = "uq_projects_name"
+
+
+def _is_name_conflict(exc: IntegrityError) -> bool:
+    cause = getattr(exc.orig, "__cause__", None)  # the original asyncpg exception
+    return (
+        getattr(exc.orig, "sqlstate", None) == UNIQUE_VIOLATION_SQLSTATE
+        and getattr(cause, "constraint_name", None) == UNIQUE_NAME_CONSTRAINT
+    )
 
 
 class ProjectRepository(Protocol):
@@ -678,7 +687,7 @@ class SqlAlchemyProjectRepository:
         try:
             await self._session.flush()
         except IntegrityError as exc:
-            if UNIQUE_NAME_CONSTRAINT in str(exc.orig):
+            if _is_name_conflict(exc):
                 raise ProjectNameConflictError(data.name) from exc
             raise
         logger.debug("Inserted project row project_id=%s", project.project_id)
@@ -731,9 +740,16 @@ class InMemoryProjectRepository:
 
 - `ProjectRepository` is a `Protocol`: any class with these methods fits, no inheritance needed.
   The service depends on this interface, not on SQLAlchemy (Dependency Inversion).
-- Name uniqueness is enforced by the database (`uq_projects_name`), not by a "check then insert"
-  query, which would race under concurrent requests. Only that constraint becomes a domain error;
-  any other integrity failure re-raises unchanged.
+- Name uniqueness is enforced by the database, not by a "check then insert" query, which would
+  race under concurrent requests: two requests can both see no row and both insert. The
+  `unique=True` column becomes the constraint `uq_projects_name` (via the naming convention and the
+  migration), and Postgres rejects the second insert atomically. The repository just inserts and
+  translates the failure: SQLAlchemy raises `IntegrityError`, and `_is_name_conflict` checks the
+  structured fields, SQLSTATE `23505` (unique violation) on `exc.orig` and `constraint_name` on its
+  `__cause__` (the asyncpg error), rather than searching the message text. Only that constraint
+  becomes `ProjectNameConflictError` (409); any other integrity failure re-raises unchanged.
+  `UNIQUE_NAME_CONSTRAINT` must equal the real constraint name, or 409 silently becomes 500; the
+  integration test `test_unique_constraint_maps_to_domain_error` guards this.
 - `InMemoryProjectRepository` keeps a `dict` keyed by `project_id` and a `set` of names, so every
   operation, including the duplicate check, is O(1). Python dicts keep insertion order, which
   equals creation order. It backs the unit and API tests.
@@ -878,7 +894,7 @@ The paths keep the trailing slash from the specification. A request without it
 (`/api/v1/projects`) gets a 307 redirect to the slash version; clients should use the exact path.
 The `/api/v1` prefix lets a future `/api/v2` live next to v1 without breaking existing clients.
 
-## Step 8. Alembic migrations
+## Step 8. Alembic setup
 
 ```bash
 poetry run alembic init -t async alembic
@@ -960,49 +976,7 @@ else:
     asyncio.run(run_async_migrations())
 ```
 
-Generate and apply the first migration (needs the `db` container from step 9 running):
-
-```bash
-docker compose up -d db
-poetry run alembic revision --autogenerate -m "create projects table"
-```
-
-Always read the generated file before committing it. It should create `projects` with the
-primary key `pk_projects` and the unique constraint `uq_projects_name`:
-
-```python
-def upgrade() -> None:
-    op.create_table(
-        "projects",
-        sa.Column("project_id", sa.Uuid(), nullable=False),
-        sa.Column("name", sa.String(length=100), nullable=False),
-        sa.Column("lead_scientist", sa.String(length=100), nullable=False),
-        sa.Column("description", sa.Text(), nullable=True),
-        sa.Column(
-            "created_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
-            nullable=False,
-        ),
-        sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
-        sa.PrimaryKeyConstraint("project_id", name=op.f("pk_projects")),
-        sa.UniqueConstraint("name", name=op.f("uq_projects_name")),
-    )
-
-
-def downgrade() -> None:
-    op.drop_table("projects")
-```
-
-```bash
-poetry run alembic upgrade head      # apply
-poetry run alembic downgrade base    # roll everything back
-poetry run alembic upgrade head      # apply again
-poetry run alembic check             # "No new upgrade operations detected." = models match the DB
-```
-
-Rule: the schema changes only through migrations. Never call `Base.metadata.create_all()` against
-the dev or production database (tests are the one exception, on a throwaway database).
+The first migration is generated in Step 9, once the database container exists.
 
 ## Step 9. Docker and Docker Compose
 
@@ -1149,7 +1123,56 @@ volumes:
 - `test_db` is in the `test` profile, so `docker compose up` skips it; naming it explicitly
   (`docker compose up -d test_db`) still starts it.
 
-Try it:
+### First migration
+
+Start the database and autogenerate the first revision from the models:
+
+```bash
+docker compose up -d db
+poetry run alembic revision --autogenerate -m "create projects table"
+```
+
+Always read the generated file before committing it. It should create `projects` with the
+primary key `pk_projects` and the unique constraint `uq_projects_name`:
+
+```python
+def upgrade() -> None:
+    op.create_table(
+        "projects",
+        sa.Column("project_id", sa.Uuid(), nullable=False),
+        sa.Column("name", sa.String(length=100), nullable=False),
+        sa.Column("lead_scientist", sa.String(length=100), nullable=False),
+        sa.Column("description", sa.Text(), nullable=True),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.PrimaryKeyConstraint("project_id", name=op.f("pk_projects")),
+        sa.UniqueConstraint("name", name=op.f("uq_projects_name")),
+    )
+
+
+def downgrade() -> None:
+    op.drop_table("projects")
+```
+
+```bash
+poetry run alembic upgrade head      # apply
+poetry run alembic downgrade base    # roll everything back
+poetry run alembic upgrade head      # apply again
+poetry run alembic check             # "No new upgrade operations detected." = models match the DB
+```
+
+Rule: the schema changes only through migrations. Never call `Base.metadata.create_all()` against
+the dev or production database (tests are the one exception, on a throwaway database).
+
+### Run the full stack
+
+The image copies `alembic/versions/`, so rebuild (`--build`) after every new migration; the
+`migrate` service then applies it before `api` starts.
 
 ```bash
 docker compose up --build -d --wait api
@@ -1161,11 +1184,13 @@ docker compose logs api        # one log line per request, with status and durat
 docker compose down            # add -v to also delete the database volume
 ```
 
-Or run the API locally against the containerised database:
+### Run the API locally
+
+Or run the API with Poetry against the containerised database:
 
 ```bash
 docker compose up -d db
-poetry run alembic upgrade head
+poetry run alembic upgrade head      # no-op if already applied; needed after down -v
 poetry run uvicorn app.main:create_app --factory --reload
 # open http://127.0.0.1:8000/docs
 ```
@@ -1900,6 +1925,7 @@ git push                                                          # watch CI go 
 | `ValidationError: database_url Field required` | No `.env` and no `DATABASE_URL` | `cp .env.example .env` |
 | `InvalidCatalogNameError` or connection refused | Database container not running, or wrong port | `docker compose up -d db` (5434) or `test_db` (5433) |
 | `NoSuchModuleError: postgresql.asyncpg` or a sync driver error | URL without `+asyncpg` | Use `postgresql+asyncpg://...` |
+| `relation "projects" does not exist` (500 on every projects call) | No revision in `alembic/versions/`, or image built before it was generated | Step 9 "First migration", then `docker compose up --build -d --wait api` |
 | Autogenerate creates an empty migration | Model not imported in `app/models/__init__.py` | Add the import, regenerate |
 | "attached to a different loop" in tests | Per-test event loops | Keep the `asyncio_default_*_loop_scope = "session"` settings |
 | 307 Temporary Redirect | Path without trailing slash | Call `/api/v1/projects/` |
