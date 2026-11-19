@@ -1237,7 +1237,7 @@ TEST_DATABASE_URL = os.environ.get(
 
 @pytest.fixture(scope="session")
 def settings() -> Settings:
-    return Settings(_env_file=None, database_url=TEST_DATABASE_URL)
+    return Settings(_env_file=None, database_url=TEST_DATABASE_URL)  # pyright: ignore[reportCallIssue]
 
 
 @pytest.fixture
@@ -1716,6 +1716,9 @@ Run:
 poetry run pytest -m "not integration"     # unit + API, no Docker needed
 docker compose up -d test_db
 poetry run pytest --cov                    # everything, fails below 80% line coverage
+docker compose --profile test down  # stops all components from test profile
+docker compose stop test_db         # stops only one component
+docker compose rm -f test_db
 ```
 
 Expected: 39 passed, total coverage around 98% (around 83% without the integration tests).
@@ -1762,7 +1765,7 @@ permissions:
   contents: read
 
 env:
-  POETRY_VERSION: "2.4.3"
+  POETRY_VERSION: "2.5.1"
   PYTHON_VERSION: "3.15"
 
 jobs:
@@ -1847,9 +1850,6 @@ jobs:
 In GitHub: Settings, Branches, add a rule for `main` requiring both jobs to pass before merging.
 
 ## Step 13. README.md
-
-Write it for someone who has never seen the project. Suggested content:
-
 ````markdown
 # Genomic Variant Analysis Platform
 
