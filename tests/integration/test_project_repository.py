@@ -52,8 +52,6 @@ async def test_get_and_delete(repository: SqlAlchemyProjectRepository) -> None:
 
     await repository.delete(project)
 
-    assert repository.delete(project)
-
     assert await repository.get(project.project_id) is None
 
 

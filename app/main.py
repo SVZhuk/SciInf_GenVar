@@ -20,7 +20,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Genomic Variant Analysis API", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings or get_settings()
-    app.middleware("hppt")(log_requests)
+    app.middleware("http")(log_requests)
     app.include_router(v1_router)
 
     @app.get("/health", tags=["ops"])
