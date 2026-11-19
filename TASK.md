@@ -9,10 +9,15 @@ sections as part of this task.
 
 ### 1. Project setup
 1.1 Initialize a Git repository on GitHub.
+
 1.2 Set up the project structure: API route handlers, services, models, schemas, database session.
+
 1.3 Set up a virtual environment using Poetry.
+
 1.4 Install core dependencies and create a base FastAPI application.
+
 1.5 Set up Docker and Docker Compose for local development.
+
 1.6 Write a `README.md` with setup instructions.
 
 ### 2. CI pipeline
