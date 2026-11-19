@@ -14,13 +14,13 @@ Do not report anything ruff, mypy or the format hook already handle: missing ann
 
 Check only what tooling cannot:
 
-1. Layers, as described in `ARCHITECTURE.md` sections 3 and 4: route handlers do not touch storage directly; services and storage code do not import fastapi; schemas hold no business logic; models hold table metadata only, no session usage or queries. Dependency-injection and session/lifespan modules may import fastapi; that is not a violation. Grep the imports to confirm.
+1. Layers: `api/v1/routes/` must not import `repositories/` or `db/`; `services/` and `repositories/` must not import fastapi; `schemas/` hold no business logic; `models/` hold table metadata only, no `Session` usage or queries. `api/deps.py` and `db/session.py` are DI/lifespan code and may import fastapi; that is not a violation. Grep the imports to confirm.
 2. HTTP: 201 on create (plus `Location` once a GET-by-id route exists), 204 with empty body on delete, 404 for unknown id, 409 on conflict, 422 left to Pydantic. `status_code` and `response_model` set on every route.
 3. Exception mapping to HTTPException lives in routes only, never in services or repositories.
 4. Pydantic v2 only: no `.dict()`, `.json()`, `class Config`, `@validator`, `parse_obj`.
 5. API shape: renamed or removed response fields, changed defaults, changed status codes.
 6. Tests: every new or changed endpoint has a happy path plus one test per documented error code in `tests/`; no test was weakened, skipped or deleted (check the diff for removed lines).
-7. Migrations: if a SQLAlchemy model changed a persisted field, a matching revision must exist under `alembic/versions/` in the same diff.
+7. Migrations: if `app/models/` changed a persisted field, a matching revision must exist under `alembic/versions/` in the same diff.
 
 Report only issues you can pin to a line in the diff. If unsure, read the file to confirm; never speculate. Ignore pre-existing issues outside the diff unless the change makes them break.
 

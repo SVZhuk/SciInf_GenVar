@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  POETRY_VERSION: '2.5.1'
+  PYTHON_VERSION: '3.15'
+
+jobs:
+  lint:
+    name: Lint and format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: pipx install "poetry==$POETRY_VERSION"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: poetry
+      - run: poetry install --no-interaction
+      - name: Lint (ruff check)
+        run: poetry run pre-commit run ruff-check --all-files --show-diff-on-failure
+      - name: Format (ruff format)
+        run: poetry run pre-commit run ruff-format --all-files --show-diff-on-failure
+      - name: Whitespace and end of file
+        run: |
+          poetry run pre-commit run trailing-whitespace --all-files --show-diff-on-failure
+          poetry run pre-commit run end-of-file-fixer  --all-files --show-diff-on-failure
+      - name: Type check (mypy)
+        run: poetry run mypy app tests
+
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: gva_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U app -d gva_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+asyncpg://app:app@localhost:5433/gva_test
+      TEST_DATABASE_URL: postgresql+asyncpg://app:app@localhost:5433/gva_test
+    steps:
+      - uses: actions/checkout@v7
+      - run: pipx install "poetry==$POETRY_VERSION"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: poetry
+      - run: poetry install --no-interaction
+      - name: Migrations apply and roll back cleanly
+        run: |
+          poetry run alembic upgrade head
+          poetry run alembic check
+          poetry run alembic downgrade base
+      - name: Test with covarage gate
+        run: poetry run pytest --cov --cov-report=term --cov-report=xml
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coverage
+          path: coverage.xml
