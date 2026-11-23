@@ -2,22 +2,23 @@
 FastAPI + Pydantic v2 training project: upload VCF files, filter and annotate variants, REST summaries.
 Async SQLAlchemy 2.0 + Postgres (AWS RDS), Alembic migrations, AWS S3, deploy to ECS Fargate.
 Python 3.15 (latest stable) locally, in Docker and in CI; modern syntax (`datetime.UTC`, `X | None`) is fine.
-Clean, minimal code; no speculative abstractions.
-Docs: `TASK.md` (week 1 brief and rubric), `ARCHITECTURE.md` (living architecture, kept up to date).
+Gold standard for trainees: clean, minimal, no speculative abstractions.
+Docs: `ARCHITECTURE.md` (living architecture), `docs/week-NN-implementation.md` (weekly guides).
 
 ## Layers (never cross)
-Route handlers → services → storage access, plus models, schemas and a database session module.
-The concrete layout is described in `ARCHITECTURE.md` sections 3 and 4; follow it.
-Route handlers stay thin (HTTP only); business rules live in services; only the storage layer talks
-to the database. Models hold table definitions only; schemas hold request/response validation only.
-Postgres for dev/test runs via `docker-compose.yml`.
+`api/v1/routes/` thin async HTTP → `services/` business rules → `repositories/` sole storage access.
+`schemas/` hold Pydantic DTOs; `models/` hold SQLAlchemy table metadata only (no Session usage).
+`api/deps.py` is DI wiring; `db/` owns engine, lifespan and per-request session; `core/` holds config + logging.
+Routes never import repositories or `db/`; services and repositories never import FastAPI.
+Domain exceptions are raised in services/repositories and mapped to HTTP status only in routes.
+Postgres for dev/test runs via `docker-compose.yml` (`db` + `test_db`).
 
 ## Rules
 - Full type hints, `X | None`, Pydantic v2 API only. No `print`, no broad `except`.
 - Logging: module loggers (`logging.getLogger(__name__)`), lazy `%s` args, ids not payloads,
   never log secrets, `DATABASE_URL` or request bodies.
-- Tests: fast unit tests (no IO) + Postgres integration tests; line coverage >= 80%;
-  FIRST principles, one behaviour per test.
+- Tests: unit tests (in-memory repository, no IO) + API tests + Postgres integration tests;
+  line coverage >= 80% gates `/check`; FIRST principles, one behaviour per test.
 - Reuse existing patterns; ask before adding abstractions, dependencies or changing API shapes.
 - Never weaken or delete a test to make it pass.
 - No double-backtick notation in comments or code. Minimal comments.

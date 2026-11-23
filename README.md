@@ -1,12 +1,14 @@
 # Genomic Variant Analysis Platform
 
-Training project: a REST API (FastAPI, Pydantic v2, async SQLAlchemy, Postgres) to upload VCF
-files, filter and annotate genomic variants and retrieve summaries. Each week adds features;
-week 1 builds the project foundation and the Projects API.
+REST API to upload VCF files, filter and annotate genomic variants and retrieve summaries.
+Week 1 scope: projects. Architecture: [ARCHITECTURE.md](ARCHITECTURE.md).
+
+You are on `week_1_implementation`: the full working week 1 solution. The step-by-step
+walkthrough that builds it is [docs/week-01-implementation.md](docs/week-01-implementation.md).
 
 ## Branches
 
-Pick the branch that matches how much help you want. Each one builds on the previous.
+Each branch builds on the previous.
 
 | Branch | Contains | Use it to |
 |---|---|---|
@@ -14,13 +16,59 @@ Pick the branch that matches how much help you want. Each one builds on the prev
 | `week_1_setup` | `main` plus detailed guidance: concrete layer layout, filled-in architecture, extra Claude Code skill | Build week 1 with a clear target structure |
 | `week_1_implementation` | `week_1_setup` plus the full working week 1 solution and a step-by-step walkthrough | Compare your work or study a reference implementation |
 
-## Start here
-
-1. Read [TASK.md](TASK.md): the week 1 brief, milestones and grading rubric.
-2. Read [ARCHITECTURE.md](ARCHITECTURE.md) and fill it in as you design.
-3. [CLAUDE.md](CLAUDE.md) holds the project rules; Claude Code agents, skills and hooks live in
-   `.claude/`.
-
 ## Requirements
 
 Python 3.15, Poetry 2.x, Docker with Compose v2, git.
+
+## Run everything in Docker
+
+```bash
+docker compose up --build
+```
+
+Starts Postgres, applies migrations, then serves the API on http://127.0.0.1:8000
+(interactive docs: http://127.0.0.1:8000/docs).
+
+## Local development
+
+```bash
+poetry install
+cp .env.example .env
+docker compose up -d db
+poetry run alembic upgrade head
+poetry run uvicorn app.main:create_app --factory --reload
+poetry run pre-commit install
+```
+
+## Tests
+
+```bash
+docker compose up -d test_db
+poetry run pytest --cov                  # all tests, 80% coverage gate
+poetry run pytest -m "not integration"   # fast, no database
+```
+
+## Migrations
+
+```bash
+poetry run alembic revision --autogenerate -m "describe the change"   # review the file!
+poetry run alembic upgrade head
+poetry run alembic downgrade -1
+```
+
+Rebuild the image (`docker compose up --build`) after adding a migration.
+
+## API
+
+| Method | Path | Success | Errors |
+|---|---|---|---|
+| POST | /api/v1/projects/ | 201 | 409, 422 |
+| GET | /api/v1/projects/ | 200 | |
+| DELETE | /api/v1/projects/{project_id}/ | 204 | 404, 422 |
+| GET | /health | 200 | |
+
+## Quality checks
+
+`poetry run python scripts/check.py` runs the full gate: dash check, ruff lint and format,
+`mypy app tests` (strict), pytest with the 80% coverage gate. CI
+(`.github/workflows/ci.yml`) runs the same checks on every push and pull request.

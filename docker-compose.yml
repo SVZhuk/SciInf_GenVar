@@ -1,0 +1,70 @@
+# Full stack:        docker compose up --build     (db, then migrate, then api on :8000)
+# Live reload:       docker compose up --build --watch
+# Dev database only: docker compose up -d db       (run API locally with Poetry)
+# Test database:     docker compose up -d test_db  (needed by integration tests)
+# Local development creds only; real env inject DATABASE_URL from a secret store.
+x-api: &api
+  build: .
+  image: gva-api:local
+  environment:
+    DATABASE_URL: postgresql+asyncpg://app:app@db:5432/gva
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: gva
+    ports:
+      - '127.0.0.1:5434:5432'
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U app -d gva']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  test_db:
+    profiles: [test]
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: gva_test
+    ports:
+      - '127.0.0.1:5433:5432'
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U app -d gva_test']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  migrate:
+    <<: *api
+    command: ['alembic', 'upgrade', 'head']
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    <<: *api
+    ports:
+      - '127.0.0.1:8000:8000'
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./app
+          target: /app/app
+        - action: rebuild
+          path: ./poetry.lock
+
+volumes:
+  db_data:
