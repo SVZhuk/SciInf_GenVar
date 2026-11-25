@@ -1,30 +1,19 @@
 """ClinVar annotation file use cases: validate, count entries, store, list, delete."""
 
-import asyncio
 import logging
 from uuid import UUID, uuid4
 
-from app.core.exceptions import (
-    AnnotationFileNotFoundError,
-    InvalidFileFormatError,
-    InvalidFilenameError,
-)
+from app.core.exceptions import AnnotationFileNotFoundError
 from app.models import AnnotationFileModel
-from app.parsers.clinvar import ClinVarSummary, parse_clinvar
-from app.parsers.text import decode_lines, file_extension
+from app.parsers.clinvar import parse_clinvar
 from app.repositories.annotation_file import AnnotationFileRepository
 from app.repositories.project import ProjectRepository
-from app.services.project import require_project
+from app.services.project_files import parse_upload, require_project
 from app.storage.files import FileStorage, object_key
 
 logger = logging.getLogger(__name__)
 
 ANNOTATION_EXTENSIONS = (".txt.gz", ".tsv.gz", ".txt", ".tsv")
-
-
-def _parse(data: bytes, extension: str, max_bytes: int) -> ClinVarSummary:
-    """CPU-bound, so it runs in a worker thread and the event loop keeps serving requests."""
-    return parse_clinvar(decode_lines(data, extension.endswith(".gz"), max_bytes))
 
 
 class AnnotationFileService:
@@ -43,20 +32,9 @@ class AnnotationFileService:
     async def upload(self, project_id: UUID, filename: str, data: bytes) -> AnnotationFileModel:
         """Same order and consistency rules as VcfFileService.upload."""
         await require_project(self._projects, project_id)
-        try:
-            extension = file_extension(filename, ANNOTATION_EXTENSIONS)
-            summary = await asyncio.to_thread(_parse, data, extension, self._max_bytes)
-        except InvalidFilenameError:
-            logger.warning("Annotation upload rejected: bad filename project_id=%s", project_id)
-            raise
-        except InvalidFileFormatError as exc:
-            logger.warning(
-                "Annotation upload rejected: project_id=%s line=%s reason=%s",
-                project_id,
-                exc.line_no,
-                exc.reason,
-            )
-            raise
+        extension, summary = await parse_upload(
+            project_id, filename, data, ANNOTATION_EXTENSIONS, parse_clinvar, self._max_bytes
+        )
         if summary.invalid_count:
             logger.warning(
                 "Annotation file has %d invalid entries project_id=%s",

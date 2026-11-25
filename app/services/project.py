@@ -3,22 +3,14 @@
 import logging
 from uuid import UUID
 
-from app.core.exceptions import ProjectNameConflictError, ProjectNotFoundError
+from app.core.exceptions import ProjectNameConflictError
 from app.models import ProjectModel
 from app.repositories.project import ProjectRepository
 from app.schemas.project import ProjectCreate
+from app.services.project_files import require_project
 from app.storage.files import FileStorage, project_prefix
 
 logger = logging.getLogger(__name__)
-
-
-async def require_project(projects: ProjectRepository, project_id: UUID) -> ProjectModel:
-    """Shared by every service that works inside a project."""
-    project = await projects.get(project_id)
-    if project is None:
-        logger.warning("Project not found project_id=%s", project_id)
-        raise ProjectNotFoundError(project_id)
-    return project
 
 
 class ProjectService:
