@@ -2,10 +2,9 @@
 
 from uuid import UUID
 
-from fastapi import APIRouter, UploadFile, status
+from fastapi import APIRouter, status
 
-from app.api.deps import AnnotationFileServiceDep, MaxUploadBytesDep
-from app.api.uploads import read_upload
+from app.api.deps import AnnotationFileServiceDep, UploadDep
 from app.schemas.annotation_file import AnnotationFileRead
 
 router = APIRouter(prefix="/projects/{project_id}/annotation", tags=["annotation files"])
@@ -14,12 +13,10 @@ router = APIRouter(prefix="/projects/{project_id}/annotation", tags=["annotation
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def upload_annotation_file(
     project_id: UUID,
-    file: UploadFile,
+    upload: UploadDep,
     service: AnnotationFileServiceDep,
-    max_bytes: MaxUploadBytesDep,
 ) -> AnnotationFileRead:
-    data = await read_upload(file, max_bytes)
-    annotation_file = await service.upload(project_id, file.filename or "", data)
+    annotation_file = await service.upload(project_id, upload.filename, upload.data)
     return AnnotationFileRead.model_validate(annotation_file)
 
 

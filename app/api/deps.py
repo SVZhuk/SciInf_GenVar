@@ -2,9 +2,10 @@
 
 from typing import Annotated
 
-from fastapi import Depends, Request
+from fastapi import Depends, Request, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.uploads import Upload, read_upload
 from app.core.config import Settings
 from app.db.session import get_session
 from app.db.unit_of_work import AfterCommit, get_after_commit
@@ -35,6 +36,13 @@ def get_max_upload_bytes(request: Request) -> int:
 
 
 MaxUploadBytesDep = Annotated[int, Depends(get_max_upload_bytes)]
+
+
+async def get_upload(file: UploadFile, max_bytes: MaxUploadBytesDep) -> Upload:
+    return await read_upload(file, max_bytes)
+
+
+UploadDep = Annotated[Upload, Depends(get_upload)]
 
 
 def get_project_service(session: SessionDep, storage: FileStorageDep) -> ProjectService:

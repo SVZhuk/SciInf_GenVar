@@ -3,10 +3,9 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Query, Request, Response, UploadFile, status
+from fastapi import APIRouter, Query, Request, Response, status
 
-from app.api.deps import MaxUploadBytesDep, VcfFileServiceDep
-from app.api.uploads import read_upload
+from app.api.deps import UploadDep, VcfFileServiceDep
 from app.schemas.vcf_file import VariantRead, VcfFileDetail, VcfFileRead
 
 router = APIRouter(prefix="/projects/{project_id}/vcf", tags=["vcf files"])
@@ -15,14 +14,12 @@ router = APIRouter(prefix="/projects/{project_id}/vcf", tags=["vcf files"])
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def upload_vcf_file(
     project_id: UUID,
-    file: UploadFile,
+    upload: UploadDep,
     service: VcfFileServiceDep,
-    max_bytes: MaxUploadBytesDep,
     request: Request,
     response: Response,
 ) -> VcfFileRead:
-    data = await read_upload(file, max_bytes)
-    vcf_file = await service.upload(project_id, file.filename or "", data)
+    vcf_file = await service.upload(project_id, upload.filename, upload.data)
     response.headers["Location"] = str(
         request.url_for("get_vcf_file", project_id=project_id, vcf_id=vcf_file.vcf_file_id)
     )
