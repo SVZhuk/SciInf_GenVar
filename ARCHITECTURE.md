@@ -90,12 +90,16 @@ Dependencies point one way: routes to services to repositories. Nothing imports 
 | Dependency Injection | `Annotated[..., Depends(...)]` in `app/api/deps.py` | Routes receive ready services; tests override one provider |
 | Unit of Work | `get_session`: `session.begin()` per request, then `AfterCommit` actions | One transaction per request; S3 deletes run only after a successful commit |
 | Decorator | `DeleteAfterCommitStorage` wraps any `FileStorage` | Services stay unaware that deletes are deferred |
-| DTO | `ProjectCreate`, `ProjectRead`, `VcfFileRead`, `VcfFileDetail`, `AnnotationFileRead`; parser output `ParsedVariant` | Clients cannot set server-owned fields; `s3_key` never leaves the server |
+| Template (generics) | `ProjectFileMixin`, `ProjectFileRepository[M]`, `require_file`, `parse_upload[T]` | Each file type writes only what differs: its columns, its parser, its `add` |
+| Exception handler | `register_error_handlers` in `app/api/errors.py`, `STATUS_BY_ERROR` | Routes have no try/except; every error body has the same shape |
+| DTO | `ProjectCreate`, `ProjectRead`, `ProjectFileRead` (base of `VcfFileRead`, `AnnotationFileRead`), `VcfFileDetail`; parser output `ParsedVariant` | Clients cannot set server-owned fields; `s3_key` never leaves the server |
 
 SOLID in practice:
 - Single responsibility: one job per layer (table above).
 - Open/closed: a new resource adds new files (schema, model, repository, service, route) and one
-  `include_router` line; existing resources do not change.
+  `include_router` line; existing resources do not change. A new file type also reuses the shared
+  file code (mixin, generic repository, `require_file`, `parse_upload`, `ProjectFileRead`), and a new
+  error subclasses a base in `core/exceptions.py`, so `api/errors.py` does not change.
 - Liskov substitution: both repositories satisfy the same Protocol; the service cannot tell them apart.
 - Interface segregation: the repository Protocol lists only the operations the service uses.
 - Dependency inversion: `ProjectService` depends on the `ProjectRepository` abstraction; only
@@ -108,14 +112,15 @@ app/
   main.py                    factory, lifespan, /health
   core/                      config.py, logging.py, exceptions.py
   db/                        base.py (Base + naming convention), session.py (engine, get_session)
-  models/                    one module per table; __init__.py imports all of them
-  schemas/                   one module per resource
-  repositories/              one module per aggregate
-  services/                  one module per resource / use case
+  models/                    one module per table; project_file.py: ProjectFileMixin (shared file columns)
+  schemas/                   one module per resource; project_file.py: ProjectFileRead base
+  repositories/              one module per aggregate; project_file.py: generic ProjectFileRepository[M]
+  services/                  one module per resource; project_files.py: require_project, require_file, parse_upload
   storage/                   files.py: FileStorage Protocol, S3 and in-memory implementations
   parsers/                   text.py (filename, gunzip), vcf.py, clinvar.py: pure functions
-  api/uploads.py             read an upload with the size limit (413)
-  api/deps.py
+  api/uploads.py             Upload, read_upload: read an upload with the size limit (413)
+  api/errors.py              register_error_handlers: domain error base class to HTTP status
+  api/deps.py                services, storage, UploadDep
   api/v1/router.py
   api/v1/routes/             one module per resource
 alembic/versions/            one revision per schema change
@@ -150,8 +155,8 @@ sequenceDiagram
     alt name exists (uq_projects_name)
         DB-->>RP: IntegrityError
         RP-->>S: ProjectNameConflictError
-        S-->>R: re-raise (WARNING logged)
-        R-->>C: 409
+        S-->>F: re-raise (WARNING logged), session rolls back
+        F-->>C: 409 from the ConflictError handler (api/errors.py)
     end
     RP-->>S: ProjectModel
     S-->>R: ProjectModel (INFO "Project created project_id=...")
@@ -310,8 +315,8 @@ definition plus Secrets Manager in AWS.
   (collected by Docker and, later, CloudWatch).
 - `log_requests` middleware: one line per request with method, path, status, duration; level INFO
   for 2xx/3xx, WARNING for 4xx, ERROR for 5xx.
-- Services log state changes at INFO and rejected requests at WARNING; repositories log row-level
-  detail at DEBUG.
+- Services log state changes at INFO and rejected requests at WARNING; repositories log at DEBUG
+  only what the service log does not say (row counts, variant batches).
 - Never logged: request bodies, query strings, `DATABASE_URL`, credentials, file content,
   uploaded filenames. Parse errors log the line number and a fixed reason only.
 - **[planned]** JSON log format and a request id for CloudWatch Logs Insights.
@@ -329,7 +334,7 @@ definition plus Secrets Manager in AWS.
 | `tests/api/` | HTTP contract through the real app | in memory (dependency override) |
 | `tests/integration/` | SQL repository, full stack with lifespan | Postgres `test_db`, rolled back per test |
 
-Line coverage gate: 80% (`[tool.coverage.report] fail_under`), currently about 99% (191 tests).
+Line coverage gate: 80% (`[tool.coverage.report] fail_under`), currently about 99% (193 tests).
 S3 code is tested against moto in process; API and integration tests use `InMemoryFileStorage`.
 Tests follow FIRST and Arrange, Act, Assert. Every endpoint has a happy-path test plus one test per
 documented error status.
@@ -366,6 +371,8 @@ documented error status.
 | 16 | No unique constraint on (`vcf_file_id`, `chrom`, `pos`, `ref`, `alt`) | Long indel alleles exceed the B-tree entry limit; the parser rejects duplicates |
 | 17 | Parsing runs in `asyncio.to_thread` | CPU work must not block the event loop |
 | 18 | `Content-Length` checked in a middleware before the body is read | Starlette spools multipart bodies to disk before the route runs |
+| 19 | Domain errors subclass `NotFoundError`, `ConflictError` or `InvalidInputError`; one handler per base class | Routes stay thin; a new error needs no HTTP code; `FileStorageError` stays a 500 |
+| 20 | File models share `ProjectFileMixin`; `file_id` is a `synonym` of each primary key | Generic repository code without renaming columns, so no migration and no API change |
 
 ## 10. Changelog by week
 
@@ -379,4 +386,6 @@ tests (coverage about 98%), pre-commit, GitHub Actions CI.
 `vcf_files`, `variants`, `annotation_files` tables and migration; VCF parser (multi-allelic split,
 AF per allele, gzip/bgzip) and ClinVar parser (full and simplified formats); S3 file storage with
 moto server in Compose; VCF upload/list/get/delete and annotation upload/list/delete endpoints;
-project and file deletes remove S3 objects after the commit; 191 tests, coverage about 99%.
+project and file deletes remove S3 objects after the commit. Refactor: domain error hierarchy
+mapped in one handler (`api/errors.py`), `UploadDep`, shared file code (`ProjectFileMixin`,
+`ProjectFileRepository[M]`, `services/project_files.py`, `ProjectFileRead`); 193 tests, coverage about 99%.
