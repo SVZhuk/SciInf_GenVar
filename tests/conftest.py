@@ -1,6 +1,7 @@
 """Shared fixtures: settings that never read .env, in-memory storage and services per test."""
 
 import os
+from uuid import UUID
 
 import pytest
 
@@ -8,6 +9,7 @@ from app.core.config import Settings
 from app.repositories.annotation_file import InMemoryAnnotationFileRepository
 from app.repositories.project import InMemoryProjectRepository
 from app.repositories.vcf_file import InMemoryVcfFileRepository
+from app.schemas.project import ProjectCreate
 from app.services.annotation_file import AnnotationFileService
 from app.services.project import ProjectService
 from app.services.vcf_file import VcfFileService
@@ -65,3 +67,9 @@ def annotation_service(
     storage: InMemoryFileStorage,
 ) -> AnnotationFileService:
     return AnnotationFileService(repository, annotation_repository, storage, MAX_BYTES)
+
+
+@pytest.fixture
+async def project_id(repository: InMemoryProjectRepository) -> UUID:
+    project = await repository.add(ProjectCreate(name="BRCA", lead_scientist="R. Franklin"))
+    return project.project_id

@@ -19,12 +19,6 @@ from app.storage.files import InMemoryFileStorage
 from tests.samples import sample_vcf
 
 
-@pytest.fixture
-async def project_id(repository: InMemoryProjectRepository) -> UUID:
-    project = await repository.add(ProjectCreate(name="BRCA", lead_scientist="R. Franklin"))
-    return project.project_id
-
-
 async def test_upload_stores_metadata_variants_and_file(
     vcf_service: VcfFileService, storage: InMemoryFileStorage, project_id: UUID
 ) -> None:

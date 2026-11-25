@@ -11,17 +11,9 @@ from app.core.exceptions import (
     ProjectNotFoundError,
 )
 from app.parsers.clinvar import ClinVarFormat
-from app.repositories.project import InMemoryProjectRepository
-from app.schemas.project import ProjectCreate
 from app.services.annotation_file import AnnotationFileService
 from app.storage.files import InMemoryFileStorage
 from tests.samples import SIMPLIFIED_HEADER, SIMPLIFIED_ROW, clinvar_text, sample_clinvar
-
-
-@pytest.fixture
-async def project_id(repository: InMemoryProjectRepository) -> UUID:
-    project = await repository.add(ProjectCreate(name="BRCA", lead_scientist="R. Franklin"))
-    return project.project_id
 
 
 async def test_upload_stores_metadata_and_file(
