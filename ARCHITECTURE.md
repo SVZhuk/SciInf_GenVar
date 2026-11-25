@@ -64,9 +64,10 @@ Dependencies point one way: routes to services to repositories. Nothing imports 
 
 | Package | Responsibility | Must not |
 |---|---|---|
-| `app/api/v1/routes/` | Map HTTP to service calls; domain errors to status codes | import `repositories/` or `db/` |
+| `app/api/v1/routes/` | Map HTTP to service calls | import `repositories/` or `db/` |
 | `app/api/v1/router.py` | Mount resource routers under `/api/v1` | contain handlers |
 | `app/api/deps.py` | Build services and their dependencies (the "beans") | contain logic |
+| `app/api/errors.py` | Map domain error base classes to HTTP status codes | know individual errors |
 | `app/services/` | Business rules and orchestration of one use case | import FastAPI |
 | `app/parsers/` | Pure functions: VCF and ClinVar validation and parsing | do IO, import other layers except `core/` |
 | `app/storage/` | File storage (S3) behind a Protocol | import FastAPI, hold business rules |
@@ -161,7 +162,7 @@ sequenceDiagram
 
 1. Validation runs before any of our code; bad input never reaches the service.
 2. One session and one transaction per request; any exception rolls everything back.
-3. Domain errors are plain Python exceptions; only routes translate them to HTTP.
+3. Domain errors are plain Python exceptions; `app/api/errors.py` maps each base class (not found, conflict, invalid input) to one status code.
 4. Output always goes through a response schema, never a raw ORM object.
 
 ## 6. Data model

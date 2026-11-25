@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.errors import register_error_handlers
 from app.api.uploads import reject_oversized_requests
 from app.api.v1.router import router as v1_router
 from app.core.config import Settings, get_settings
@@ -25,6 +26,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings or get_settings()
     app.middleware("http")(reject_oversized_requests)
     app.middleware("http")(log_requests)  # added last, runs first: logs every response
+    register_error_handlers(app)
     app.include_router(v1_router)
 
     @app.get("/health", tags=["ops"])

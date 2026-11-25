@@ -10,7 +10,7 @@ Docs: `ARCHITECTURE.md` (living architecture), `docs/week-NN-implementation.md` 
 `schemas/` hold Pydantic DTOs; `models/` hold SQLAlchemy table metadata only (no Session usage).
 `api/deps.py` is DI wiring; `db/` owns engine, lifespan and per-request session; `core/` holds config + logging.
 Routes never import repositories or `db/`; services and repositories never import FastAPI.
-Domain exceptions are raised in services/repositories and mapped to HTTP status only in routes.
+Domain exceptions are raised in services/repositories and mapped to HTTP status only in `api/errors.py` (one handler per base class).
 Postgres for dev/test runs via `docker-compose.yml` (`db` + `test_db`).
 
 ## Rules
