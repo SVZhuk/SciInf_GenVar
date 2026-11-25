@@ -1,37 +1,21 @@
-from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import (
-    BigInteger,
-    DateTime,
-    ForeignKey,
-    Identity,
-    Index,
-    String,
-    Text,
-    func,
-)
+from sqlalchemy import BigInteger, ForeignKey, Identity, Index, Text
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, synonym
 
 from app.db.base import Base
+from app.models.project_file import ProjectFileMixin
 
 
-class VcfFileModel(Base):
+class VcfFileModel(ProjectFileMixin, Base):
     __tablename__ = "vcf_files"
 
     vcf_file_id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
-    project_id: Mapped[UUID] = mapped_column(
-        ForeignKey("projects.project_id", ondelete="CASCADE"), index=True
-    )
-    filename: Mapped[str] = mapped_column(String(255))
-    s3_key: Mapped[str] = mapped_column(String(1024), unique=True)
+    file_id: Mapped[UUID] = synonym("vcf_file_id")
     sample_count: Mapped[int]
     variant_count: Mapped[int]
-    uploaded_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
 
 
 class VariantModel(Base):

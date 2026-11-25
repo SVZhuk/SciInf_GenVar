@@ -84,7 +84,7 @@ Dependencies point one way: routes to services to repositories. Nothing imports 
 |---|---|---|
 | Application Factory | `create_app(settings)` in `app/main.py` | Fresh, explicitly configured app per test; no import-time side effects |
 | Layered architecture | routes, services, repositories | Each change touches one layer |
-| Repository | `ProjectRepository`, `VcfFileRepository`, `AnnotationFileRepository` Protocols, each with a SQLAlchemy and an in-memory implementation | Storage swappable without touching services or routes |
+| Repository | `ProjectRepository`, `VcfFileRepository`, `AnnotationFileRepository` Protocols, each with a SQLAlchemy and an in-memory implementation; file repositories extend the generic `ProjectFileRepository[M]` | Storage swappable without touching services or routes |
 | Strategy (via Protocol) | `FileStorage`: `S3FileStorage`, `InMemoryFileStorage` | Services and tests never need a real S3 |
 | Service Layer | `ProjectService`, `VcfFileService`, `AnnotationFileService` | One home for multi-step use cases (validate, parse, insert rows, write S3) |
 | Dependency Injection | `Annotated[..., Depends(...)]` in `app/api/deps.py` | Routes receive ready services; tests override one provider |

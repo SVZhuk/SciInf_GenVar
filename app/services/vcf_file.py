@@ -8,7 +8,7 @@ from app.models import VariantModel, VcfFileModel
 from app.parsers.vcf import parse_vcf
 from app.repositories.project import ProjectRepository
 from app.repositories.vcf_file import VcfFileRepository
-from app.services.project_files import parse_upload, require_project
+from app.services.project_files import parse_upload, require_file, require_project
 from app.storage.files import FileStorage, object_key
 
 logger = logging.getLogger(__name__)
@@ -67,22 +67,16 @@ class VcfFileService:
     async def get_vcf_file(
         self, project_id: UUID, vcf_file_id: UUID, limit: int, offset: int
     ) -> tuple[VcfFileModel, list[VariantModel]]:
-        vcf_file = await self._require_vcf_file(project_id, vcf_file_id)
+        vcf_file = await require_file(
+            self._projects, self._vcf_files, project_id, vcf_file_id, VcfFileNotFoundError
+        )
         variants = await self._vcf_files.list_variants(vcf_file_id, limit, offset)
         return vcf_file, variants
 
     async def delete_vcf_file(self, project_id: UUID, vcf_file_id: UUID) -> None:
-        vcf_file = await self._require_vcf_file(project_id, vcf_file_id)
+        vcf_file = await require_file(
+            self._projects, self._vcf_files, project_id, vcf_file_id, VcfFileNotFoundError
+        )
         await self._vcf_files.delete(vcf_file)
         await self._storage.delete(vcf_file.s3_key)
         logger.info("VCF file deleted vcf_file_id=%s project_id=%s", vcf_file_id, project_id)
-
-    async def _require_vcf_file(self, project_id: UUID, vcf_file_id: UUID) -> VcfFileModel:
-        await require_project(self._projects, project_id)
-        vcf_file = await self._vcf_files.get(project_id, vcf_file_id)
-        if vcf_file is None:
-            logger.warning(
-                "VCF file not found vcf_file_id=%s project_id=%s", vcf_file_id, project_id
-            )
-            raise VcfFileNotFoundError(vcf_file_id)
-        return vcf_file

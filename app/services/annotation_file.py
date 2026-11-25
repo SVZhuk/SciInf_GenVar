@@ -8,7 +8,7 @@ from app.models import AnnotationFileModel
 from app.parsers.clinvar import parse_clinvar
 from app.repositories.annotation_file import AnnotationFileRepository
 from app.repositories.project import ProjectRepository
-from app.services.project_files import parse_upload, require_project
+from app.services.project_files import parse_upload, require_file, require_project
 from app.storage.files import FileStorage, object_key
 
 logger = logging.getLogger(__name__)
@@ -66,15 +66,13 @@ class AnnotationFileService:
         return await self._annotation_files.list_for_project(project_id)
 
     async def delete_annotation_file(self, project_id: UUID, annotation_file_id: UUID) -> None:
-        await require_project(self._projects, project_id)
-        annotation_file = await self._annotation_files.get(project_id, annotation_file_id)
-        if annotation_file is None:
-            logger.warning(
-                "Annotation file not found annotation_file_id=%s project_id=%s",
-                annotation_file_id,
-                project_id,
-            )
-            raise AnnotationFileNotFoundError(annotation_file_id)
+        annotation_file = await require_file(
+            self._projects,
+            self._annotation_files,
+            project_id,
+            annotation_file_id,
+            AnnotationFileNotFoundError,
+        )
         await self._annotation_files.delete(annotation_file)
         await self._storage.delete(annotation_file.s3_key)
         logger.info(
