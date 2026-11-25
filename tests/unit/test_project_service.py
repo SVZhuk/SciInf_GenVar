@@ -6,6 +6,7 @@ import pytest
 from app.core.exceptions import ProjectNameConflictError, ProjectNotFoundError
 from app.schemas.project import ProjectCreate
 from app.services.project import ProjectService
+from app.storage.files import InMemoryFileStorage
 
 
 def new_project(name: str = "BRCA cohort") -> ProjectCreate:
@@ -54,3 +55,16 @@ async def test_delete_unknown_project_raises_and_warns(
         await service.delete_project(uuid4())
 
     assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+async def test_delete_project_removes_its_files(
+    service: ProjectService, storage: InMemoryFileStorage
+) -> None:
+    project = await service.create_project(new_project())
+    other = await service.create_project(new_project("other"))
+    await storage.put(f"projects/{project.project_id}/vcf/a.vcf", b"x")
+    await storage.put(f"projects/{other.project_id}/vcf/b.vcf", b"y")
+
+    await service.delete_project(project.project_id)
+
+    assert list(storage.objects) == [f"projects/{other.project_id}/vcf/b.vcf"]

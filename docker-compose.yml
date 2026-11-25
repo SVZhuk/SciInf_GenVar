@@ -2,6 +2,7 @@
 # Live reload:       docker compose up --build --watch
 # Dev database only: docker compose up -d db       (run API locally with Poetry)
 # Test database:     docker compose up -d test_db  (needed by integration tests)
+# Local S3:          s3 (moto server, objects in memory) on :9000; s3-init creates the bucket
 # Local development creds only; real env inject DATABASE_URL from a secret store.
 x-api: &api
   build: .
@@ -9,6 +10,13 @@ x-api: &api
   environment:
     DATABASE_URL: postgresql+asyncpg://app:app@db:5432/gva
     LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    S3_BUCKET: ${S3_BUCKET:-gva-files}
+    S3_ENDPOINT_URL: http://s3:5000
+
+# Fake keys for the local moto S3 only; on AWS the ECS task role provides credentials.
+x-local-s3-credentials: &local-s3-credentials
+  AWS_ACCESS_KEY_ID: local
+  AWS_SECRET_ACCESS_KEY: local
 
 services:
   db:
@@ -44,6 +52,26 @@ services:
       timeout: 5s
       retries: 5
 
+  s3:
+    image: motoserver/moto:5.2.6
+    ports:
+      - '127.0.0.1:9000:5000'
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/moto-api/')"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  s3-init:
+    image: motoserver/moto:5.2.6
+    environment:
+      <<: *local-s3-credentials
+      S3_BUCKET: ${S3_BUCKET:-gva-files}
+    entrypoint: ["python", "-c", "import boto3, os; boto3.client('s3', endpoint_url='http://s3:5000', region_name='us-east-1').create_bucket(Bucket=os.environ['S3_BUCKET'])"]
+    depends_on:
+      s3:
+        condition: service_healthy
+
   migrate:
     <<: *api
     command: ['alembic', 'upgrade', 'head']
@@ -53,10 +81,18 @@ services:
 
   api:
     <<: *api
+    environment:
+      DATABASE_URL: postgresql+asyncpg://app:app@db:5432/gva
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      S3_BUCKET: ${S3_BUCKET:-gva-files}
+      S3_ENDPOINT_URL: http://s3:5000
+      <<: *local-s3-credentials
     ports:
       - '127.0.0.1:8000:8000'
     depends_on:
       migrate:
+        condition: service_completed_successfully
+      s3-init:
         condition: service_completed_successfully
     develop:
       watch:

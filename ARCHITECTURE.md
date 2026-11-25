@@ -87,7 +87,8 @@ Dependencies point one way: routes to services to repositories. Nothing imports 
 | Strategy (via Protocol) | `FileStorage`: `S3FileStorage`, `InMemoryFileStorage` | Services and tests never need a real S3 |
 | Service Layer | `ProjectService`, `VcfFileService`, `AnnotationFileService` | One home for multi-step use cases (validate, parse, insert rows, write S3) |
 | Dependency Injection | `Annotated[..., Depends(...)]` in `app/api/deps.py` | Routes receive ready services; tests override one provider |
-| Unit of Work | `get_session`: `session.begin()` per request | One transaction per request; commit or roll back as a whole |
+| Unit of Work | `get_session`: `session.begin()` per request, then `AfterCommit` actions | One transaction per request; S3 deletes run only after a successful commit |
+| Decorator | `DeleteAfterCommitStorage` wraps any `FileStorage` | Services stay unaware that deletes are deferred |
 | DTO | `ProjectCreate`, `ProjectRead`, `VcfFileRead`, `VcfFileDetail`, `AnnotationFileRead`; parser output `ParsedVariant` | Clients cannot set server-owned fields; `s3_key` never leaves the server |
 
 SOLID in practice:
@@ -230,7 +231,7 @@ erDiagram
 |---|---|---|
 | `projects` | **[done]** | `pk_projects`, `uq_projects_name`; index on `created_at` once listing is paginated |
 | `vcf_files` | **[done]** | `fk_vcf_files_project_id_projects` (cascade), `uq_vcf_files_s3_key`, `ix_vcf_files_project_id` |
-| `variants` | **[done]** | FK to vcf_files (cascade); `uq_variants_vcf_file_id_chrom_pos_ref_alt`; `ix_variants_chrom_pos` for region queries |
+| `variants` | **[done]** | FK to vcf_files (cascade); `ix_variants_vcf_file_id_variant_id` (paging, cascade); `ix_variants_chrom_pos` for region queries; no unique index on alleles (decision 16) |
 | `annotation_files` | **[done]** | FK to projects (cascade), `uq_annotation_files_s3_key`, `ix_annotation_files_project_id` |
 | `annotations` | **[planned]** | FKs to variants and annotation_files (cascade); unique (`variant_id`, `annotation_file_id`); index on `gene` |
 
@@ -241,7 +242,8 @@ Design decisions:
   sequential 8-byte key keeps the index compact. Resources clients address directly (projects,
   files) use UUIDs, which do not leak counts and can be generated anywhere.
 - Multi-allelic VCF lines are split into one row per ALT allele, so (`chrom`, `pos`, `ref`, `alt`)
-  identifies a variant within a file.
+  identifies a variant within a file. The parser enforces it; a unique index cannot, because long
+  indel alleles exceed the B-tree entry limit (about 2.7 KB).
 - `af` has its own column (one value per ALT allele) because variants are filtered by it.
 - Free text read from a VCF (`chrom`, `ref`, `alt`, ...) is `text`: no natural length limit, and
   Postgres stores `text` and `varchar` the same way.
@@ -251,7 +253,8 @@ Design decisions:
 - Enumerated values (`annotation_files.column_format`) are `VARCHAR` validated by a Python
   `StrEnum`, not native Postgres enums: adding a value is then an ordinary migration.
 - Deleting a project cascades to its files, variants and annotations (`ON DELETE CASCADE`).
-  `ProjectService` deletes the S3 objects under `projects/{project_id}/` after the rows.
+  `ProjectService` deletes the S3 objects under `projects/{project_id}/` once the delete has
+  committed.
 - S3 keys are built from ids only: `projects/{project_id}/vcf/{vcf_file_id}.vcf[.gz]` and
   `projects/{project_id}/annotation/{annotation_file_id}.txt[.gz]`.
 - Column naming: snake_case; plural table names; primary key `<entity>_id` (`project_id`,
@@ -325,7 +328,7 @@ definition plus Secrets Manager in AWS.
 | `tests/api/` | HTTP contract through the real app | in memory (dependency override) |
 | `tests/integration/` | SQL repository, full stack with lifespan | Postgres `test_db`, rolled back per test |
 
-Line coverage gate: 80% (`[tool.coverage.report] fail_under`), currently about 99% (173 tests).
+Line coverage gate: 80% (`[tool.coverage.report] fail_under`), currently about 99% (191 tests).
 S3 code is tested against moto in process; API and integration tests use `InMemoryFileStorage`.
 Tests follow FIRST and Arrange, Act, Assert. Every endpoint has a happy-path test plus one test per
 documented error status.
@@ -353,12 +356,15 @@ documented error status.
 | 7 | Settings injected into `create_app` | Tests never depend on `.env`; no import-time side effects |
 | 8 | Python 3.15, the latest stable release | Same version locally, in Docker and in CI |
 | 9 | Parse uploads synchronously, 201, no status column | KISS for files up to 50 MB; a queue can come when needed |
-| 10 | Flush rows first, then write S3; delete rows first, then S3 | An S3 failure rolls the rows back; the only leftover case is a harmless orphaned object |
+| 10 | Upload: flush rows, then write S3. Delete: delete rows, commit, then delete S3 (`AfterCommit`) | No row ever points at a missing file; the only leftover case is a harmless orphaned object, logged at ERROR |
 | 11 | One `variants` row per ALT allele with its own `af` | (`chrom`, `pos`, `ref`, `alt`) identifies a variant; AF filters are plain SQL |
 | 12 | Hand-written VCF and ClinVar parsers | No C extensions; explicit, tested rules with line numbers in errors |
 | 13 | ClinVar full format = `AlleleID` first, at least 32 columns, required columns present | NCBI appends columns over time (40 in 2026); the simplified 12-column format is exact |
 | 14 | Local S3 is moto server | MinIO stopped publishing Docker images; moto is also the test fake |
 | 15 | Decompression capped at `MAX_UPLOAD_BYTES`, all gzip members read | Gzip bomb protection; bgzip files have many members |
+| 16 | No unique constraint on (`vcf_file_id`, `chrom`, `pos`, `ref`, `alt`) | Long indel alleles exceed the B-tree entry limit; the parser rejects duplicates |
+| 17 | Parsing runs in `asyncio.to_thread` | CPU work must not block the event loop |
+| 18 | `Content-Length` checked in a middleware before the body is read | Starlette spools multipart bodies to disk before the route runs |
 
 ## 10. Changelog by week
 
@@ -372,4 +378,4 @@ tests (coverage about 98%), pre-commit, GitHub Actions CI.
 `vcf_files`, `variants`, `annotation_files` tables and migration; VCF parser (multi-allelic split,
 AF per allele, gzip/bgzip) and ClinVar parser (full and simplified formats); S3 file storage with
 moto server in Compose; VCF upload/list/get/delete and annotation upload/list/delete endpoints;
-project delete also removes its S3 objects; 173 tests, coverage about 99%.
+project and file deletes remove S3 objects after the commit; 191 tests, coverage about 99%.

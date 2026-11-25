@@ -6,7 +6,7 @@ them and count their valid entries; list, read and delete both kinds of file.
 Read [ARCHITECTURE.md](../ARCHITECTURE.md) first and finish
 [week 1](week-01-implementation.md); this guide builds on that code.
 
-Every code block below is complete and was verified end to end (173 tests, 99% coverage, mypy
+Every code block below is complete and was verified end to end (191 tests, 99% coverage, mypy
 strict, the Docker stack serving every endpoint). Type it (or copy it) exactly, run the check at
 the end of each step, and commit once the step works. Files that week 1 created and this week
 changes are shown as a diff (`+` lines added, `-` lines removed) when the change is small, and in
@@ -48,10 +48,14 @@ full otherwise.
 | Decision | Why |
 |---|---|
 | Parse synchronously inside the upload request, return 201 | KISS: files are capped at 50 MB; a job queue can come later if uploads grow |
+| Parsing runs in a worker thread (`asyncio.to_thread`) | It is CPU work; on the event loop it would stall every other request, health checks included |
 | No `status` column on `vcf_files` | A row exists only after a successful parse, so it could only ever say "parsed" |
 | Raw file in S3, metadata and variants in Postgres | Rows stay small; the original file is kept for re-processing |
 | S3 key built by the server: `projects/{project_id}/vcf/{vcf_file_id}.vcf.gz` | A client filename never becomes a path; deleting a project is one prefix delete |
-| Rows are written (flushed) before the S3 object | If S3 fails, the transaction rolls back and nothing is half-saved |
+| Upload: rows are written (flushed) before the S3 object | If S3 fails, the transaction rolls back and nothing is half-saved |
+| Delete: S3 objects are removed only after the commit (`AfterCommit`) | If the commit fails, rows and files both survive; a database row never points at a missing file |
+| No unique constraint on (`vcf_file_id`, `chrom`, `pos`, `ref`, `alt`) | A B-tree entry is limited to about 2.7 KB and long indel alleles exceed it; the parser rejects duplicates |
+| Oversized bodies are refused from the `Content-Length` header | Starlette writes a multipart body to a temp file before the route runs; checking afterwards would let a 20 GB upload fill the disk |
 | A multi-allelic line becomes one row per ALT allele, each with its own AF | (`chrom`, `pos`, `ref`, `alt`) then identifies a variant; filtering by AF is a plain `WHERE` |
 | Hand-written parser, no pysam/cyvcf2 | No C extension to install; the format rules are explicit and tested |
 | Annotation upload stores the file and metadata only | The task asks to validate and count; matching entries to variants is a later week |
@@ -111,8 +115,6 @@ Then widen the `python-multipart` pin Poetry wrote for a `0.0.x` version, so pat
 +    s3_endpoint_url: str | None = None
 +    aws_region: str = "us-east-1"
 +    max_upload_bytes: int = 50 * 1024 * 1024  # also caps a .gz file after decompression
-
-
 ```
 
 - `s3_endpoint_url` is `None` on AWS (boto3 finds the regional endpoint) and points at the local
@@ -138,7 +140,7 @@ Then widen the `python-multipart` pin Poetry wrote for a `0.0.x` version, so pat
 `app/core/exceptions.py`:
 
 ```diff
-@@ -14,2 +14,32 @@ class ProjectNameConflictError(Exception):
+@@ -14,2 +14,36 @@ class ProjectNameConflictError(Exception):
          super().__init__(f"Project name {name!r} already exists")
          self.name = name
 +
@@ -163,6 +165,10 @@ Then widen the `python-multipart` pin Poetry wrote for a `0.0.x` version, so pat
 +        )
 +
 +
++class FileStorageError(Exception):
++    """The file store refused an operation; raised by storage, never mapped to a 4xx."""
++
++
 +class InvalidFileFormatError(Exception):
 +    """File content is invalid; the message names the line and the rule, never the content."""
 +
@@ -173,6 +179,7 @@ Then widen the `python-multipart` pin Poetry wrote for a `0.0.x` version, so pat
 +        self.line_no = line_no
 ```
 
+`FileStorageError` wraps boto3 errors, so code above the storage layer never imports botocore.
 `InvalidFileFormatError` keeps `reason` and `line_no` as attributes, so services can log them as
 structured fields. Its message names the rule that failed, never the offending content: a VCF
 line can hold patient data, and the message goes into the HTTP response and the log.
@@ -217,7 +224,7 @@ def decode_lines(data: bytes, gzipped: bool, max_bytes: int) -> list[str]:
     if b"\x00" in data:
         raise InvalidFileFormatError("file contains NUL bytes")
     try:
-        text = data.decode("utf-8")
+        text = data.decode("utf-8-sig")  # drops a byte order mark written by Windows tools
     except UnicodeDecodeError as exc:
         raise InvalidFileFormatError("file is not UTF-8 text") from exc
     return text.splitlines()
@@ -253,6 +260,8 @@ def _gunzip(data: bytes, max_bytes: int) -> bytes:
   `unused_data` holds the bytes after the current member, so the loop reads all of them.
 - Postgres cannot store the NUL character in `text` or `jsonb`; rejecting it here turns a would-be
   500 into a 422.
+- `utf-8-sig` decodes UTF-8 and drops a byte order mark if there is one (Excel and other Windows
+  tools write it); otherwise the first line would not start with `##fileformat` or `AlleleID`.
 
 ## Step 4. VCF parser
 
@@ -285,7 +294,14 @@ HEADER_COLUMNS = ("#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO")
 FIXED_COLUMNS_WITH_FORMAT = len(HEADER_COLUMNS) + 1
 MISSING = "."
 REF_PATTERN = re.compile(r"[ACGTN]+", re.IGNORECASE)
-ALT_PATTERN = re.compile(r"[ACGTN]+|\*|<[^<>]+>", re.IGNORECASE)
+ALT_PATTERN = re.compile(
+    r"[ACGTN]+"  # bases
+    r"|\*"  # allele missing because of an upstream deletion
+    r"|<[^<>]+>"  # symbolic allele, e.g. <DEL>
+    r"|[ACGTN]*[\[\]][^\[\]]+[\[\]][ACGTN]*"  # breakend, e.g. G]17:198982]
+    r"|\.[ACGTN]+|[ACGTN]+\.",  # single breakend, e.g. .A
+    re.IGNORECASE,
+)
 
 type InfoValue = str | bool
 
@@ -383,7 +399,7 @@ def _parse_info(info: str, no: int) -> dict[str, InfoValue]:
 
 
 def _allele_frequencies(af: InfoValue | None, alt_count: int, no: int) -> list[float | None]:
-    if af is None:
+    if af is None or af == MISSING:  # one "." stands for every allele
         return [None] * alt_count
     if isinstance(af, bool):
         raise InvalidFileFormatError("AF must have a value", no)
@@ -416,8 +432,12 @@ def _parse_number(value: str, name: str, no: int) -> float | None:
 - `float()` accepts `"nan"` and `"inf"`, which are not valid numbers in a VCF and not valid JSON;
   `math.isfinite` rejects them.
 - A reference-only line (`ALT` is `.`) carries no variant and is skipped, not rejected.
-- Duplicates are rejected here, so the database unique constraint (step 6) never has to turn a
-  user mistake into a 500.
+- `AF=.` is one missing value for all alleles (the VCF specification allows a single `.` for a
+  missing list), so it becomes `None` for each allele instead of failing the length check.
+- `ALT_PATTERN` accepts bases, `*`, symbolic alleles (`<DEL>`) and the breakends written by
+  structural variant callers (`G]17:198982]`, `.A`).
+- Duplicates (same `CHROM`, `POS`, `REF`, `ALT`) are rejected here, the only place they are
+  checked (step 6 explains why the database does not).
 - `ParsedVariant` is a frozen dataclass with `slots=True`: immutable and small, which matters when
   a file has hundreds of thousands of variants. Its fields have the same names as the `variants`
   columns, so `asdict(variant)` is ready to insert.
@@ -529,22 +549,8 @@ def _is_positive_integer(value: str) -> bool:
 | Table | Columns | Constraints and indexes |
 |---|---|---|
 | `vcf_files` | `vcf_file_id` uuid PK, `project_id`, `filename`, `s3_key`, `sample_count`, `variant_count`, `uploaded_at` | FK to projects `ON DELETE CASCADE`, index on `project_id`, unique `s3_key` |
-| `variants` | `variant_id` bigint identity PK, `vcf_file_id`, `chrom`, `pos`, `vcf_id`, `ref`, `alt`, `qual`, `filter`, `af`, `info` jsonb | FK to vcf_files `ON DELETE CASCADE`, unique (`vcf_file_id`, `chrom`, `pos`, `ref`, `alt`), index (`chrom`, `pos`) |
+| `variants` | `variant_id` bigint identity PK, `vcf_file_id`, `chrom`, `pos`, `vcf_id`, `ref`, `alt`, `qual`, `filter`, `af`, `info` jsonb | FK to vcf_files `ON DELETE CASCADE`, index (`vcf_file_id`, `variant_id`), index (`chrom`, `pos`) |
 | `annotation_files` | `annotation_file_id` uuid PK, `project_id`, `filename`, `s3_key`, `column_format`, `entry_count`, `uploaded_at` | FK to projects `ON DELETE CASCADE`, index on `project_id`, unique `s3_key` |
-
-First, one line in `app/db/base.py`, so a multi-column unique constraint gets a name that lists
-all its columns (`uq_variants_vcf_file_id_chrom_pos_ref_alt`, not `uq_variants_vcf_file_id`).
-For one column the name is unchanged, so `uq_projects_name` stays as it is:
-
-```diff
-@@ -4,5 +4,5 @@ from sqlalchemy.orm import DeclarativeBase
- NAMING_CONVENTION = {
-     "ix": "ix_%(column_0_label)s",
--    "uq": "uq_%(table_name)s_%(column_0_name)s",
-+    "uq": "uq_%(table_name)s_%(column_0_N_name)s",
-     "ck": "ck_%(table_name)s_%(constraint_name)s",
-     "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
-```
 
 `app/models/vcf_file.py`:
 
@@ -561,7 +567,6 @@ from sqlalchemy import (
     Index,
     String,
     Text,
-    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -588,8 +593,10 @@ class VcfFileModel(Base):
 
 class VariantModel(Base):
     __tablename__ = "variants"
+    # No unique (vcf_file_id, chrom, pos, ref, alt): a B-tree entry is limited to about 2.7 KB
+    # and long indel alleles exceed it. The parser rejects duplicates instead.
     __table_args__ = (
-        UniqueConstraint("vcf_file_id", "chrom", "pos", "ref", "alt"),
+        Index("ix_variants_vcf_file_id_variant_id", "vcf_file_id", "variant_id"),
         Index("ix_variants_chrom_pos", "chrom", "pos"),
     )
 
@@ -658,8 +665,12 @@ __all__ = ["AnnotationFileModel", "Base", "ProjectModel", "VariantModel", "VcfFi
 - `qual` and `af` are `Mapped[float | None]`: SQLAlchemy maps them to double precision.
 - `info` is `jsonb`: INFO keys differ between variant callers, so they do not get columns. `af`
   does get its own column because the platform filters on it.
-- No `variants` index on `vcf_file_id` alone: the unique constraint starts with `vcf_file_id`, so
-  its index already serves "variants of this file".
+- No unique constraint on (`vcf_file_id`, `chrom`, `pos`, `ref`, `alt`), although that is the
+  natural key. Postgres limits one B-tree index entry to about 2.7 KB, and a structural deletion
+  can have a REF allele of several kilobases: the insert would fail with "index row size exceeds
+  btree maximum" and the upload would be a 500. The parser enforces uniqueness instead.
+- Index (`vcf_file_id`, `variant_id`) serves both "one page of this file's variants, in file
+  order" (step 8) and the cascade delete, which looks variants up by `vcf_file_id`.
 
 Generate, read, and test the migration:
 
@@ -766,20 +777,19 @@ def upgrade() -> None:
             ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("variant_id", name=op.f("pk_variants")),
-        sa.UniqueConstraint(
-            "vcf_file_id",
-            "chrom",
-            "pos",
-            "ref",
-            "alt",
-            name=op.f("uq_variants_vcf_file_id_chrom_pos_ref_alt"),
-        ),
     )
     op.create_index("ix_variants_chrom_pos", "variants", ["chrom", "pos"], unique=False)
+    op.create_index(
+        "ix_variants_vcf_file_id_variant_id",
+        "variants",
+        ["vcf_file_id", "variant_id"],
+        unique=False,
+    )
 
 
 def downgrade() -> None:
     """Downgrade schema."""
+    op.drop_index("ix_variants_vcf_file_id_variant_id", table_name="variants")
     op.drop_index("ix_variants_chrom_pos", table_name="variants")
     op.drop_table("variants")
     op.drop_index(op.f("ix_vcf_files_project_id"), table_name="vcf_files")
@@ -868,12 +878,17 @@ through the API. `VcfFileDetail` extends `VcfFileRead` (DRY) with one page of va
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
+from functools import partial
 from typing import TYPE_CHECKING, Protocol
 from uuid import UUID
 
 import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 
 from app.core.config import Settings
+from app.core.exceptions import FileStorageError
+from app.db.unit_of_work import AfterCommit
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client  # type stubs are a dev dependency
@@ -909,11 +924,17 @@ class S3FileStorage:
         logger.debug("Stored object key=%s bytes=%d", key, len(data))
 
     async def delete(self, key: str) -> None:
-        await asyncio.to_thread(self._client.delete_object, Bucket=self._bucket, Key=key)
+        try:
+            await asyncio.to_thread(self._client.delete_object, Bucket=self._bucket, Key=key)
+        except (BotoCoreError, ClientError) as exc:
+            raise FileStorageError(f"S3 could not delete key={key}") from exc
         logger.debug("Deleted object key=%s", key)
 
     async def delete_prefix(self, prefix: str) -> None:
-        count = await asyncio.to_thread(self._delete_prefix, prefix)
+        try:
+            count = await asyncio.to_thread(self._delete_prefix, prefix)
+        except (BotoCoreError, ClientError) as exc:
+            raise FileStorageError(f"S3 could not delete prefix={prefix}") from exc
         logger.debug("Deleted %d objects under prefix=%s", count, prefix)
 
     def _delete_prefix(self, prefix: str) -> int:
@@ -925,9 +946,12 @@ class S3FileStorage:
             keys: list[ObjectIdentifierTypeDef] = [
                 {"Key": obj["Key"]} for obj in page.get("Contents", []) if "Key" in obj
             ]
-            if keys:
-                self._client.delete_objects(Bucket=self._bucket, Delete={"Objects": keys})
-                count += len(keys)
+            if not keys:
+                continue
+            response = self._client.delete_objects(Bucket=self._bucket, Delete={"Objects": keys})
+            if errors := response.get("Errors"):  # partial failure is HTTP 200, not an exception
+                raise FileStorageError(f"S3 could not delete {len(errors)} objects")
+            count += len(keys)
         return count
 
 
@@ -948,6 +972,35 @@ class InMemoryFileStorage:
             del self.objects[key]
 
 
+class DeleteAfterCommitStorage:
+    """Decorator: writes happen at once, deletes wait until the database commit has succeeded.
+
+    If the commit fails, the rows come back and their files are still there. If a delete fails
+    after the commit, the object is orphaned (no row points to it): logged, not raised, because
+    the client's delete has already succeeded.
+    """
+
+    def __init__(self, storage: FileStorage, after_commit: AfterCommit) -> None:
+        self._storage = storage
+        self._after_commit = after_commit
+
+    async def put(self, key: str, data: bytes) -> None:
+        await self._storage.put(key, data)
+
+    async def delete(self, key: str) -> None:
+        self._after_commit.add(partial(self._run, self._storage.delete, key))
+
+    async def delete_prefix(self, prefix: str) -> None:
+        self._after_commit.add(partial(self._run, self._storage.delete_prefix, prefix))
+
+    @staticmethod
+    async def _run(delete: Callable[[str], Awaitable[None]], target: str) -> None:
+        try:
+            await delete(target)
+        except FileStorageError as exc:
+            logger.error("Orphaned file after commit: %s", exc)
+
+
 def build_file_storage(settings: Settings) -> S3FileStorage:
     """Credentials come from the default AWS chain (env vars locally, the ECS task role on AWS)."""
     client = boto3.client(
@@ -966,8 +1019,101 @@ def build_file_storage(settings: Settings) -> S3FileStorage:
   annotation `S3Client` needs no quotes.
 - `object_key` builds keys from ids only. A filename like `../../etc/passwd` stays plain text in
   the `filename` column and never touches a path.
+- `S3FileStorage` turns boto3 errors into `FileStorageError`. `delete_objects` needs an extra
+  check: when some keys cannot be deleted it still answers HTTP 200 and lists them under
+  `Errors`, so ignoring the response would report success for objects that are still there.
+- `DeleteAfterCommitStorage` is a Decorator: it has the `FileStorage` methods, passes `put`
+  through and turns `delete` and `delete_prefix` into actions that run after the commit (below).
+  Services do not know about it; `api/deps.py` wraps the real storage per request. A delete that
+  fails after the commit is logged at ERROR and not raised: the client's delete has succeeded and
+  only an orphaned object (no row points to it) is left.
 - `build_file_storage` creates one client per process (step 10, lifespan). Creating a client does
   no network call; the first request does.
+
+`app/db/unit_of_work.py`:
+
+```python
+"""Actions that must wait until the request transaction has committed."""
+
+from collections.abc import Awaitable, Callable
+
+type Action = Callable[[], Awaitable[None]]
+
+
+class AfterCommit:
+    """Collected during a request, run by get_session once the commit has succeeded."""
+
+    def __init__(self) -> None:
+        self._actions: list[Action] = []
+
+    def add(self, action: Action) -> None:
+        self._actions.append(action)
+
+    async def run(self) -> None:
+        for action in self._actions:
+            await action()
+        self._actions.clear()
+
+
+def get_after_commit() -> AfterCommit:
+    """FastAPI caches a dependency per request, so the session and the storage share one."""
+    return AfterCommit()
+```
+
+`app/db/session.py`, run the actions once the transaction has committed:
+
+```diff
+@@ -2,11 +2,13 @@
+
+ import logging
+-from collections.abc import AsyncIterator
++from collections.abc import AsyncGenerator
+ from contextlib import asynccontextmanager
++from typing import Annotated
+
+-from fastapi import FastAPI, Request
++from fastapi import Depends, FastAPI, Request
+ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+ from app.core.config import Settings
++from app.db.unit_of_work import AfterCommit, get_after_commit
+
+ logger = logging.getLogger(__name__)
+@@ -14,5 +16,5 @@ logger = logging.getLogger(__name__)
+
+ @asynccontextmanager
+-async def database_lifespan(app: FastAPI, settings: Settings) -> AsyncIterator[None]:
++async def database_lifespan(app: FastAPI, settings: Settings) -> AsyncGenerator[None]:
+     engine = create_async_engine(settings.database_url.get_secret_value(), pool_pre_ping=True)
+     app.state.sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+@@ -25,7 +27,14 @@ async def database_lifespan(app: FastAPI, settings: Settings) -> AsyncIterator[N
+
+
+-async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
+-    """Unit of Work: commit if the request succeeds, roll back if anything raises."""
++async def get_session(
++    request: Request, after_commit: Annotated[AfterCommit, Depends(get_after_commit)]
++) -> AsyncGenerator[AsyncSession]:
++    """Unit of Work: commit if the request succeeds, roll back if anything raises.
++
++    Actions in after_commit (S3 deletes) run only after a successful commit.
++    """
+     sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.sessionmaker
+-    async with sessionmaker() as session, session.begin():
+-        yield session
++    async with sessionmaker() as session:
++        async with session.begin():
++            yield session
++        await after_commit.run()
+```
+
+- `session.begin()` commits when its block ends without an exception. Only then does
+  `after_commit.run()` execute; if the request raised, the exception leaves `get_session` before
+  that line and the actions are dropped with the rollback.
+- `get_after_commit` returns a new `AfterCommit`, and FastAPI calls a dependency once per request
+  and reuses the result, so `get_session` and `get_file_storage` receive the same instance.
+- The session dependency uses `scope="function"` (week 1), so the commit and the S3 deletes both
+  finish before the response is sent.
 
 ## Step 8. Repositories
 
@@ -1246,13 +1392,14 @@ class ProjectService:
 ```python
 """VCF use cases: validate, parse, store the file and its variants, list, read, delete."""
 
+import asyncio
 import logging
 from uuid import UUID, uuid4
 
 from app.core.exceptions import InvalidFileFormatError, InvalidFilenameError, VcfFileNotFoundError
 from app.models import VariantModel, VcfFileModel
 from app.parsers.text import decode_lines, file_extension
-from app.parsers.vcf import parse_vcf
+from app.parsers.vcf import ParsedVcf, parse_vcf
 from app.repositories.project import ProjectRepository
 from app.repositories.vcf_file import VcfFileRepository
 from app.services.project import require_project
@@ -1261,6 +1408,11 @@ from app.storage.files import FileStorage, object_key
 logger = logging.getLogger(__name__)
 
 VCF_EXTENSIONS = (".vcf.gz", ".vcf")
+
+
+def _parse(data: bytes, extension: str, max_bytes: int) -> ParsedVcf:
+    """CPU-bound, so it runs in a worker thread and the event loop keeps serving requests."""
+    return parse_vcf(decode_lines(data, extension.endswith(".gz"), max_bytes))
 
 
 class VcfFileService:
@@ -1285,7 +1437,7 @@ class VcfFileService:
         await require_project(self._projects, project_id)
         try:
             extension = file_extension(filename, VCF_EXTENSIONS)
-            parsed = parse_vcf(decode_lines(data, extension.endswith(".gz"), self._max_bytes))
+            parsed = await asyncio.to_thread(_parse, data, extension, self._max_bytes)
         except InvalidFilenameError:
             logger.warning("VCF upload rejected: bad filename project_id=%s", project_id)
             raise
@@ -1351,6 +1503,7 @@ class VcfFileService:
 ```python
 """ClinVar annotation file use cases: validate, count entries, store, list, delete."""
 
+import asyncio
 import logging
 from uuid import UUID, uuid4
 
@@ -1360,7 +1513,7 @@ from app.core.exceptions import (
     InvalidFilenameError,
 )
 from app.models import AnnotationFileModel
-from app.parsers.clinvar import parse_clinvar
+from app.parsers.clinvar import ClinVarSummary, parse_clinvar
 from app.parsers.text import decode_lines, file_extension
 from app.repositories.annotation_file import AnnotationFileRepository
 from app.repositories.project import ProjectRepository
@@ -1370,6 +1523,11 @@ from app.storage.files import FileStorage, object_key
 logger = logging.getLogger(__name__)
 
 ANNOTATION_EXTENSIONS = (".txt.gz", ".tsv.gz", ".txt", ".tsv")
+
+
+def _parse(data: bytes, extension: str, max_bytes: int) -> ClinVarSummary:
+    """CPU-bound, so it runs in a worker thread and the event loop keeps serving requests."""
+    return parse_clinvar(decode_lines(data, extension.endswith(".gz"), max_bytes))
 
 
 class AnnotationFileService:
@@ -1390,7 +1548,7 @@ class AnnotationFileService:
         await require_project(self._projects, project_id)
         try:
             extension = file_extension(filename, ANNOTATION_EXTENSIONS)
-            summary = parse_clinvar(decode_lines(data, extension.endswith(".gz"), self._max_bytes))
+            summary = await asyncio.to_thread(_parse, data, extension, self._max_bytes)
         except InvalidFilenameError:
             logger.warning("Annotation upload rejected: bad filename project_id=%s", project_id)
             raise
@@ -1462,8 +1620,14 @@ The upload use case, in order:
 | 5 | Write the raw file to S3 | S3 error, 500, step 4 rolled back |
 | 6 | Commit when the request ends (`get_session`) | 500; the S3 object is orphaned but harmless |
 
-Deletes run the same way round: delete the rows (flush), then the S3 object. If S3 fails, the
-rows come back with the rollback, so the database never points at a missing file.
+Step 3 runs in a worker thread (`asyncio.to_thread(_parse, ...)`): unzipping and parsing a 50 MB
+file is CPU work that would otherwise block the event loop for seconds. With the GIL the thread
+does not make parsing faster, but Python switches threads every few milliseconds, so the loop
+keeps answering other requests and `/health`.
+
+Deletes are the other way round: the rows are deleted (flushed) at once, the S3 objects only
+after the commit, through `DeleteAfterCommitStorage` (step 7). If the commit fails, rows and files
+both survive, so the database never points at a missing file.
 
 Logging, as set up in week 1:
 
@@ -1482,23 +1646,53 @@ either: users name files after patients or samples.
 `app/api/uploads.py`:
 
 ```python
-"""Read an uploaded file into memory, refusing anything over the configured size."""
+"""Upload size limits: an early check on the request header and an exact one on the file."""
 
-from fastapi import HTTPException, UploadFile, status
+from collections.abc import Awaitable, Callable
+
+from fastapi import HTTPException, Request, Response, UploadFile, status
+from fastapi.responses import JSONResponse
+
+from app.core.config import Settings
+
+MULTIPART_OVERHEAD_BYTES = 64 * 1024  # boundaries and part headers around the file
+
+
+def too_large_detail(max_bytes: int) -> str:
+    return f"File is larger than {max_bytes} bytes"
+
+
+async def reject_oversized_requests(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    """Refuse a body announced as too large before Starlette spools it to disk."""
+    settings: Settings = request.app.state.settings
+    content_length = request.headers.get("content-length", "")
+    limit = settings.max_upload_bytes + MULTIPART_OVERHEAD_BYTES
+    if content_length.isdigit() and int(content_length) > limit:
+        return JSONResponse(
+            {"detail": too_large_detail(settings.max_upload_bytes)},
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+        )
+    return await call_next(request)
 
 
 async def read_upload(file: UploadFile, max_bytes: int) -> bytes:
+    """Exact check on the file itself; also covers bodies sent without Content-Length."""
     data = await file.read(max_bytes + 1)  # one byte more than allowed is enough to know
     if len(data) > max_bytes:
-        raise HTTPException(
-            status.HTTP_413_CONTENT_TOO_LARGE, detail=f"File is larger than {max_bytes} bytes"
-        )
+        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, detail=too_large_detail(max_bytes))
     return data
 ```
 
-Reading `max_bytes + 1` bytes is enough to know a file is too large without reading all of it.
-The status code is an HTTP concern, so this helper lives in the API layer and raises
-`HTTPException` directly.
+Two checks, both in the API layer because a status code is an HTTP concern:
+- `reject_oversized_requests` is a middleware. Starlette parses a multipart body, and writes the
+  file to a temporary file, before the route function runs, so a check inside the route comes too
+  late to protect the disk. The middleware answers 413 from the `Content-Length` header alone,
+  before the body is read. It allows 64 KB on top of the limit for the multipart framing.
+- `read_upload` is the exact check on the file itself. It also covers clients that send the body
+  in chunks without `Content-Length`. Reading `max_bytes + 1` bytes is enough to know a file is
+  too large without reading all of it.
 
 `app/api/deps.py`:
 
@@ -1512,20 +1706,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.db.session import get_session
+from app.db.unit_of_work import AfterCommit, get_after_commit
 from app.repositories.annotation_file import SqlAlchemyAnnotationFileRepository
 from app.repositories.project import SqlAlchemyProjectRepository
 from app.repositories.vcf_file import SqlAlchemyVcfFileRepository
 from app.services.annotation_file import AnnotationFileService
 from app.services.project import ProjectService
 from app.services.vcf_file import VcfFileService
-from app.storage.files import FileStorage
+from app.storage.files import DeleteAfterCommitStorage, FileStorage
 
 SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]
 
 
-def get_file_storage(request: Request) -> FileStorage:
+def get_file_storage(
+    request: Request, after_commit: Annotated[AfterCommit, Depends(get_after_commit)]
+) -> FileStorage:
     storage: FileStorage = request.app.state.file_storage
-    return storage
+    return DeleteAfterCommitStorage(storage, after_commit)
 
 
 FileStorageDep = Annotated[FileStorage, Depends(get_file_storage)]
@@ -1725,21 +1922,39 @@ router.include_router(vcf_files.router)
 router.include_router(annotation_files.router)
 ```
 
-`app/main.py`, build the S3 storage once at startup:
+`app/main.py`, build the S3 storage once at startup and register the size check:
 
 ```diff
-@@ -8,4 +8,5 @@ from app.core.config import Settings, get_settings
+@@ -1,17 +1,20 @@
+-from collections.abc import AsyncIterator
++from collections.abc import AsyncGenerator
+ from contextlib import asynccontextmanager
+
+ from fastapi import FastAPI
+
++from app.api.uploads import reject_oversized_requests
+ from app.api.v1.router import router as v1_router
+ from app.core.config import Settings, get_settings
  from app.core.logging import configure_logging, log_requests
  from app.db.session import database_lifespan
 +from app.storage.files import build_file_storage
 
 
-@@ -14,4 +15,5 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+ @asynccontextmanager
+-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
++async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
      settings: Settings = app.state.settings
      configure_logging(settings.log_level)
 +    app.state.file_storage = build_file_storage(settings)
      async with database_lifespan(app, settings):
          yield
+@@ -21,5 +24,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
+     app = FastAPI(title="Genomic Variant Analysis API", version="0.1.0", lifespan=lifespan)
+     app.state.settings = settings or get_settings()
+-    app.middleware("http")(log_requests)
++    app.middleware("http")(reject_oversized_requests)
++    app.middleware("http")(log_requests)  # added last, runs first: logs every response
+     app.include_router(v1_router)
 ```
 
 | Method | Path | Success | Errors |
@@ -2099,6 +2314,10 @@ def test_decode_lines_stops_at_decompressed_limit() -> None:
 def test_decode_lines_rejects_bad_bytes(data: bytes, gzipped: bool) -> None:
     with pytest.raises(InvalidFileFormatError):
         decode_lines(data, gzipped, LIMIT)
+
+
+def test_decode_lines_drops_byte_order_mark() -> None:
+    assert decode_lines(b"\xef\xbb\xbfa\n", False, LIMIT) == ["a"]
 ```
 
 `tests/unit/test_vcf_parser.py`:
@@ -2216,10 +2435,19 @@ def test_rejects_invalid_record_with_line_number(record: str) -> None:
     assert error.value.line_no == 4
 
 
-def test_accepts_symbolic_and_spanning_alleles() -> None:
-    variants = parse("chr1\t100\t.\tA\t<DEL>,*\t.\t.\t.")
+@pytest.mark.parametrize(
+    "alt", ["<DEL>", "*", "G]17:198982]", "]13:123456]T", "C[2:321682[", "[17:198983[A", ".A", "G."]
+)
+def test_accepts_symbolic_spanning_and_breakend_alleles(alt: str) -> None:
+    [variant] = parse(f"chr1\t100\t.\tA\t{alt}\t.\t.\t.")
 
-    assert [v.alt for v in variants] == ["<DEL>", "*"]
+    assert variant.alt == alt
+
+
+def test_single_missing_af_applies_to_every_allele() -> None:
+    variants = parse("chr1\t100\t.\tA\tG,T\t.\t.\tAF=.")
+
+    assert [v.af for v in variants] == [None, None]
 
 
 def test_rejects_duplicate_variant() -> None:
@@ -2331,6 +2559,7 @@ def test_rejects_file_without_valid_entries() -> None:
 ```python
 import gzip
 import logging
+import threading
 from uuid import UUID, uuid4
 
 import pytest
@@ -2341,6 +2570,7 @@ from app.core.exceptions import (
     ProjectNotFoundError,
     VcfFileNotFoundError,
 )
+from app.parsers.vcf import ParsedVcf, parse_vcf
 from app.repositories.project import InMemoryProjectRepository
 from app.schemas.project import ProjectCreate
 from app.services.vcf_file import VcfFileService
@@ -2470,6 +2700,22 @@ async def test_delete_removes_rows_and_file(
 async def test_delete_unknown_file_raises(vcf_service: VcfFileService, project_id: UUID) -> None:
     with pytest.raises(VcfFileNotFoundError):
         await vcf_service.delete_vcf_file(project_id, uuid4())
+
+
+async def test_upload_parses_in_a_worker_thread(
+    vcf_service: VcfFileService, project_id: UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    threads: list[int] = []
+
+    def spy(lines: list[str]) -> ParsedVcf:
+        threads.append(threading.get_ident())
+        return parse_vcf(lines)
+
+    monkeypatch.setattr("app.services.vcf_file.parse_vcf", spy)
+
+    await vcf_service.upload(project_id, "calls.vcf", sample_vcf())
+
+    assert threads != [threading.get_ident()]
 ```
 
 `tests/unit/test_annotation_file_service.py`:
@@ -2710,7 +2956,9 @@ async def test_annotation_delete(annotation_repository: InMemoryAnnotationFileRe
 `tests/unit/test_file_storage.py`:
 
 ```python
+import logging
 from collections.abc import Iterator
+from typing import Any
 from uuid import uuid4
 
 import boto3
@@ -2719,7 +2967,10 @@ from moto import mock_aws
 from mypy_boto3_s3 import S3Client
 
 from app.core.config import Settings
+from app.core.exceptions import FileStorageError
+from app.db.unit_of_work import AfterCommit
 from app.storage.files import (
+    DeleteAfterCommitStorage,
     InMemoryFileStorage,
     S3FileStorage,
     build_file_storage,
@@ -2804,6 +3055,65 @@ async def test_in_memory_delete_prefix() -> None:
     await storage.delete_prefix("p1/")
 
     assert storage.objects == {"p2/b": b"y"}
+
+
+async def test_s3_delete_prefix_raises_on_partial_failure(
+    s3_client: S3Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = S3FileStorage(s3_client, BUCKET)
+    await storage.put("p1/a", b"x")
+
+    def refuse(**_: object) -> dict[str, Any]:  # S3 reports per-key failures with HTTP 200
+        return {"Errors": [{"Key": "p1/a", "Code": "AccessDenied"}]}
+
+    monkeypatch.setattr(s3_client, "delete_objects", refuse)
+
+    with pytest.raises(FileStorageError):
+        await storage.delete_prefix("p1/")
+
+
+async def test_s3_delete_prefix_client_error_becomes_storage_error(s3_client: S3Client) -> None:
+    with pytest.raises(FileStorageError):
+        await S3FileStorage(s3_client, "missing-bucket").delete_prefix("p1/")
+
+
+async def test_s3_delete_client_error_becomes_storage_error(s3_client: S3Client) -> None:
+    with pytest.raises(FileStorageError):
+        await S3FileStorage(s3_client, "missing-bucket").delete("a")
+
+
+class BrokenStorage(InMemoryFileStorage):
+    async def delete(self, key: str) -> None:
+        raise FileStorageError(f"refused key={key}")
+
+
+async def test_deferred_storage_writes_at_once_and_deletes_after_commit() -> None:
+    storage, after_commit = InMemoryFileStorage(), AfterCommit()
+    deferred = DeleteAfterCommitStorage(storage, after_commit)
+    await deferred.put("p1/a", b"x")
+    await deferred.put("p2/b", b"y")
+
+    await deferred.delete("p1/a")
+    await deferred.delete_prefix("p2/")
+    before_commit = dict(storage.objects)
+    await after_commit.run()
+
+    assert before_commit == {"p1/a": b"x", "p2/b": b"y"}
+    assert storage.objects == {}
+
+
+async def test_deferred_storage_logs_failed_delete_instead_of_raising(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    after_commit = AfterCommit()
+    await DeleteAfterCommitStorage(BrokenStorage(), after_commit).delete("p1/a")
+
+    await after_commit.run()
+
+    assert any(
+        record.levelno == logging.ERROR and "p1/a" in record.getMessage()
+        for record in caplog.records
+    )
 ```
 
 `mock_aws()` replaces the AWS endpoints inside the process, so `S3FileStorage` runs its real boto3
@@ -2877,6 +3187,7 @@ from uuid import uuid4
 from httpx import ASGITransport, AsyncClient
 
 from app.api.deps import get_vcf_file_service
+from app.api.uploads import MULTIPART_OVERHEAD_BYTES
 from app.core.config import Settings
 from app.main import create_app
 from app.services.vcf_file import VcfFileService
@@ -3046,6 +3357,15 @@ async def test_delete_in_unknown_project_returns_404(client: AsyncClient) -> Non
     response = await client.delete(f"{vcf_url(str(uuid4()))}{uuid4()}")
 
     assert response.status_code == 404
+
+
+async def test_announced_oversized_body_is_rejected_before_parsing(settings: Settings) -> None:
+    app = create_app(settings.model_copy(update={"max_upload_bytes": 10}))
+    body = b"x" * (MULTIPART_OVERHEAD_BYTES + 11)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(vcf_url(str(uuid4())), files={"file": ("a.vcf", body)})
+
+    assert response.status_code == 413
 ```
 
 `tests/api/test_annotation_files.py`:
@@ -3181,20 +3501,19 @@ session-scoped settings untouched), so they need an 11-byte body, not a 50 MB on
 deleting a project deletes S3 objects, so the week 1 end-to-end test needs storage too:
 
 ```diff
-@@ -4,8 +4,12 @@ from collections.abc import AsyncIterator
+@@ -4,8 +4,11 @@ from collections.abc import AsyncIterator
 
  import pytest_asyncio
 +from httpx import ASGITransport, AsyncClient
  from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
-+from app.api.deps import get_file_storage
  from app.core.config import Settings
 +from app.main import create_app
  from app.models import Base
 +from app.storage.files import InMemoryFileStorage
 
 
-@@ -32,2 +36,16 @@ async def session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
+@@ -32,2 +35,16 @@ async def session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
              await session.close()
              await conn.rollback()
 +
@@ -3205,11 +3524,11 @@ deleting a project deletes S3 objects, so the week 1 end-to-end test needs stora
 +) -> AsyncIterator[AsyncClient]:
 +    """Real app, lifespan and Postgres (requests commit); S3 replaced by in-memory storage."""
 +    app = create_app(settings)
-+    app.dependency_overrides[get_file_storage] = lambda: storage
 +    async with (
 +        app.router.lifespan_context(app),
 +        AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client,
 +    ):
++        app.state.file_storage = storage  # replaces S3 behind the real dependency chain
 +        yield client
 ```
 
@@ -3250,7 +3569,6 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import AnnotationFileModel, VariantModel, VcfFileModel
@@ -3357,11 +3675,15 @@ async def test_delete_cascades_to_variants(
     assert await count_variants(session) == 0
 
 
-async def test_duplicate_variant_is_rejected_by_database(
+async def test_long_alleles_are_stored(
     vcf_files: SqlAlchemyVcfFileRepository, project_id: UUID
 ) -> None:
-    with pytest.raises(IntegrityError):
-        await vcf_files.add(new_vcf_file(project_id), [variant(1), variant(1)])
+    deletion = ParsedVariant("chr1", 1, None, "A" * 10_000, "A", None, None, None, {})
+
+    vcf_file = await vcf_files.add(new_vcf_file(project_id), [deletion])
+
+    [stored] = await vcf_files.list_variants(vcf_file.vcf_file_id, limit=1, offset=0)
+    assert len(stored.ref) == 10_000
 
 
 async def test_deleting_project_cascades_to_files(
@@ -3437,13 +3759,66 @@ async def test_file_lifecycle(e2e_client: AsyncClient, storage: InMemoryFileStor
     assert (await e2e_client.get(f"{base}/vcf/")).status_code == 404
 ```
 
+`tests/integration/test_unit_of_work.py`:
+
+```python
+"""get_session runs after-commit actions only when the transaction commits."""
+
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from typing import cast
+
+import pytest
+from fastapi import Request
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+
+from app.db.session import get_session
+from app.db.unit_of_work import AfterCommit
+
+pytestmark = pytest.mark.integration
+
+
+def fake_request(engine: AsyncEngine) -> Request:
+    state = SimpleNamespace(sessionmaker=async_sessionmaker(engine, expire_on_commit=False))
+    return cast(Request, SimpleNamespace(app=SimpleNamespace(state=state)))
+
+
+async def record(calls: list[str]) -> None:
+    calls.append("ran")
+
+
+async def test_actions_run_after_commit(engine: AsyncEngine) -> None:
+    calls: list[str] = []
+    after_commit = AfterCommit()
+    after_commit.add(lambda: record(calls))
+
+    async with asynccontextmanager(get_session)(fake_request(engine), after_commit):
+        assert calls == []
+
+    assert calls == ["ran"]
+
+
+async def test_actions_skipped_on_rollback(engine: AsyncEngine) -> None:
+    calls: list[str] = []
+    after_commit = AfterCommit()
+    after_commit.add(lambda: record(calls))
+
+    with pytest.raises(RuntimeError):
+        async with asynccontextmanager(get_session)(fake_request(engine), after_commit):
+            raise RuntimeError("request failed")
+
+    assert calls == []
+```
+
 - `test_add_inserts_variants_in_batches` inserts `INSERT_BATCH_SIZE + 1` rows, so the last,
   partial batch is exercised too.
 - `test_deleting_project_cascades_to_files` proves the `ON DELETE CASCADE` chain in real
   Postgres: project, then files, then variants. `expunge_all()` drops the objects cached in the
   session, so the following queries really read the database.
-- `test_duplicate_variant_is_rejected_by_database` shows the constraint is a real safety net
-  behind the parser check.
+- `test_long_alleles_are_stored` stores a 10 kb REF allele, the case a unique index on the
+  allele columns would turn into a 500.
+- `test_unit_of_work.py` checks the after-commit contract directly: actions run after a commit
+  and are dropped when the request raises.
 
 Run:
 
@@ -3453,7 +3828,7 @@ docker compose up -d test_db
 poetry run python scripts/check.py         # everything, fails below 80% line coverage
 ```
 
-Expected: 173 passed, total coverage around 99% (around 92% without the integration tests).
+Expected: 191 passed, total coverage around 99% (around 92% without the integration tests).
 
 CI needs no change: the new dependencies come from `poetry.lock`, the S3 tests use moto in
 process, and the integration tests replace S3 with the in-memory storage.
@@ -3522,7 +3897,6 @@ Update the scope line, the branch table, the run instructions and the API table:
 +```
 +
  ## Quality checks
-
 ````
 
 ## Final verification
@@ -3551,5 +3925,7 @@ git push                                                          # watch CI go 
 | 422 `decompressed file is larger than ...` for a small `.gz` | The content after decompression is over `MAX_UPLOAD_BYTES` (the gzip bomb guard) | Raise `MAX_UPLOAD_BYTES` or split the file |
 | 422 `AF has 1 values for 2 ALT alleles` | AF must have one value per ALT allele | Fix the file (`bcftools +fill-tags` recomputes AF) |
 | ClinVar file rejected with a header error | Header renamed or fewer than 32 columns | Use the NCBI file or the exact 12-column header |
-| `alembic check` reports a changed unique constraint | Naming convention line in `app/db/base.py` not updated | Step 6, first diff |
-| Event loop stalls under load during uploads | Blocking boto3 call in `async def` | Wrap it in `asyncio.to_thread` (step 7) |
+| Event loop stalls under load during uploads | Blocking boto3 call or parsing in `async def` | Wrap it in `asyncio.to_thread` (steps 7 and 9) |
+| Editor warning `asynccontextmanager` is deprecated | Function annotated `-> AsyncIterator[...]`; the decorator needs `athrow` and `aclose`, which only an async generator has | Annotate `-> AsyncGenerator[...]` (`main.py`, `session.py`) |
+| 500 `index row size exceeds btree maximum` | A unique index over `ref`/`alt` | Do not index unbounded allele text (step 6) |
+| S3 objects still there after a delete, ERROR `Orphaned file after commit` | S3 refused the delete after the commit | Fix bucket permissions; delete the logged keys |
