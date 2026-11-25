@@ -1,18 +1,14 @@
-from datetime import datetime
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
+from app.schemas.project_file import ProjectFileRead
 
-class VcfFileRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
 
+class VcfFileRead(ProjectFileRead):
     vcf_file_id: UUID
-    project_id: UUID
-    filename: str
     sample_count: int
     variant_count: int
-    uploaded_at: datetime
 
 
 class VariantRead(BaseModel):

@@ -1,17 +1,10 @@
-from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
-
 from app.parsers.clinvar import ClinVarFormat
+from app.schemas.project_file import ProjectFileRead
 
 
-class AnnotationFileRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
+class AnnotationFileRead(ProjectFileRead):
     annotation_file_id: UUID
-    project_id: UUID
-    filename: str
     column_format: ClinVarFormat
     entry_count: int
-    uploaded_at: datetime
