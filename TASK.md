@@ -1,3 +1,11 @@
+# Tasks: Genomic Variant Analysis Platform
+
+One section per week. Each week builds on the code of the previous one; the assessment criteria
+and test rules in week 1 apply to every week.
+
+- [Week 1: Project setup, CI and the Projects API](#week-1-project-setup-ci-and-the-projects-api)
+- [Week 2: VCF and ClinVar annotation files](#week-2-vcf-and-clinvar-annotation-files)
+
 # Week 1: Project setup, CI and the Projects API
 
 Build the foundation of the Genomic Variant Analysis Platform: a FastAPI service backed by
@@ -95,115 +103,117 @@ Work through it in order and tick items off. Items marked **(decision)** are arc
 record each one, with its reason, in the `ARCHITECTURE.md` decision log.
 
 ### Repository and tooling
-- [ ] GitHub repository created; default branch `main`.
-- [ ] `.gitignore` written **before the first commit** (virtual environment, `.env`, caches,
+- [x] GitHub repository created; default branch `main`.
+- [x] `.gitignore` written **before the first commit** (virtual environment, `.env`, caches,
       coverage files). A secret committed once stays in the history.
-- [ ] One branch per piece of work, merged through a pull request so CI checks it.
-- [ ] Poetry project with an in-project `.venv`; `poetry.lock` committed; runtime and dev
+- [x] One branch per piece of work, merged through a pull request so CI checks it.
+- [x] Poetry project with an in-project `.venv`; `poetry.lock` committed; runtime and dev
       dependencies in separate groups.
-- [ ] Python version pinned in one place and the same locally, in Docker and in CI.
-- [ ] ruff (lint + format) and mypy configured in `pyproject.toml`.
+- [x] Python version pinned in one place and the same locally, in Docker and in CI.
+- [x] ruff (lint + format) and mypy configured in `pyproject.toml`.
 
 ### Structure and architecture
-- [ ] **(decision)** Layers with one job each, dependencies pointing one way only:
+- [x] **(decision)** Layers with one job each, dependencies pointing one way only:
       route handlers, then services, then storage access. Route handlers never touch the database;
       services and storage code never import FastAPI.
-- [ ] Separate packages or modules for route handlers, services, storage access, SQLAlchemy models,
+- [x] Separate packages or modules for route handlers, services, storage access, SQLAlchemy models,
       Pydantic schemas, the database session, and configuration.
-- [ ] **(decision)** Storage behind an interface (for example a `typing.Protocol`) with two
+- [x] **(decision)** Storage behind an interface (for example a `typing.Protocol`) with two
       implementations: one for Postgres and one in memory. Services depend on the interface,
       not on SQLAlchemy.
-- [ ] **(decision)** Dependency injection: FastAPI `Depends` providers wired in one module; that
+- [x] **(decision)** Dependency injection: FastAPI `Depends` providers wired in one module; that
       module is the only place that picks concrete implementations.
-- [ ] **(decision)** Domain errors (for example "project not found", "name already exists") are
+- [x] **(decision)** Domain errors (for example "project not found", "name already exists") are
       plain Python exceptions raised in services or storage code, and turned into HTTP status
-      codes only in route handlers.
-- [ ] **(decision)** An application factory (a function that builds the FastAPI app), so tests get
+      codes only in route handlers. (Since week 2: only in the exception handlers of
+      `app/api/errors.py`, one per base class.)
+- [x] **(decision)** An application factory (a function that builds the FastAPI app), so tests get
       a fresh, explicitly configured app with no side effects at import time.
 
 ### Configuration and logging
-- [ ] All settings come from environment variables through pydantic-settings; `.env` is
+- [x] All settings come from environment variables through pydantic-settings; `.env` is
       git-ignored and `.env.example` is committed.
-- [ ] The database URL is held as a secret type (`SecretStr`) so it cannot leak through logs or
+- [x] The database URL is held as a secret type (`SecretStr`) so it cannot leak through logs or
       tracebacks.
-- [ ] Logging configured once at startup; one logger per module.
-- [ ] One log line per request: method, path, status code, duration. 4xx at WARNING, 5xx at ERROR.
-- [ ] State changes logged at INFO with ids (project created, project deleted); rejected
+- [x] Logging configured once at startup; one logger per module.
+- [x] One log line per request: method, path, status code, duration. 4xx at WARNING, 5xx at ERROR.
+- [x] State changes logged at INFO with ids (project created, project deleted); rejected
       requests at WARNING.
-- [ ] Nothing sensitive in logs: no request bodies, query strings, database URLs or credentials.
+- [x] Nothing sensitive in logs: no request bodies, query strings, database URLs or credentials.
 
 ### Database
-- [ ] ER diagram for all five tables in `ARCHITECTURE.md` section 6: primary keys, foreign keys,
+- [x] ER diagram for all five tables in `ARCHITECTURE.md` section 6: primary keys, foreign keys,
       relationships, main columns and types.
-- [ ] **(decision)** Key types: UUIDs for resources clients address directly; consider `bigint`
+- [x] **(decision)** Key types: UUIDs for resources clients address directly; consider `bigint`
       for very large tables such as `variants`. Explain your choice.
-- [ ] **(decision)** Where uploaded file contents live (database or object storage) and what happens
+- [x] **(decision)** Where uploaded file contents live (database or object storage) and what happens
       to child rows when a project is deleted.
-- [ ] A constraint naming convention set on the SQLAlchemy metadata, so every constraint has a
+- [x] A constraint naming convention set on the SQLAlchemy metadata, so every constraint has a
       predictable name.
-- [ ] `projects` model exactly as in the table above; nullability follows the type hints.
-- [ ] **(decision)** Name uniqueness enforced by a database unique constraint, not by a "check,
+- [x] `projects` model exactly as in the table above; nullability follows the type hints.
+- [x] **(decision)** Name uniqueness enforced by a database unique constraint, not by a "check,
       then insert" query, which races under concurrent requests. The constraint violation is
       turned into a domain error.
-- [ ] One database session (one transaction) per request: commit on success, roll back on any
+- [x] One database session (one transaction) per request: commit on success, roll back on any
       error.
-- [ ] Alembic initialised with the async template; the database URL comes from your settings, not
+- [x] Alembic initialised with the async template; the database URL comes from your settings, not
       from `alembic.ini`.
-- [ ] First migration generated, **read by hand**, and checked: `upgrade head`, `downgrade base`,
+- [x] First migration generated, **read by hand**, and checked: `upgrade head`, `downgrade base`,
       `upgrade head` all work. The schema changes only through migrations.
 
 ### API
-- [ ] Separate Pydantic models for input (create) and output (read); clients cannot send
+- [x] Separate Pydantic models for input (create) and output (read); clients cannot send
       server-owned fields (`project_id`, `created_at`, `completed_at`).
-- [ ] Input validation in the schema: strings stripped, length limits, required fields.
-- [ ] `POST /projects/` returns 201 with the created project; 409 on a duplicate name; 422 on
+- [x] Input validation in the schema: strings stripped, length limits, required fields.
+- [x] `POST /projects/` returns 201 with the created project; 409 on a duplicate name; 422 on
       invalid input.
-- [ ] `GET /projects/` returns 200 with a list in a stable order (oldest first).
-- [ ] `DELETE /projects/{project_id}/` returns 204 with an empty body; 404 for an unknown id;
+- [x] `GET /projects/` returns 200 with a list in a stable order (oldest first).
+- [x] `DELETE /projects/{project_id}/` returns 204 with an empty body; 404 for an unknown id;
       422 for an id that is not a UUID.
-- [ ] Every route declares its `status_code` and `response_model`.
-- [ ] `GET /health` returns 200 (used by the Docker health check).
-- [ ] **(decision)** Whether to add a version prefix such as `/api/v1`. If you do, say so in the
+- [x] Every route declares its `status_code` and `response_model`. (Since week 2: the response
+      model comes from the return annotation, which FastAPI uses the same way.)
+- [x] `GET /health` returns 200 (used by the Docker health check).
+- [x] **(decision)** Whether to add a version prefix such as `/api/v1`. If you do, say so in the
       README.
 
 ### Docker
-- [ ] Multi-stage `Dockerfile`: dependencies installed in a builder stage, slim runtime image,
+- [x] Multi-stage `Dockerfile`: dependencies installed in a builder stage, slim runtime image,
       runs as a non-root user, health check.
-- [ ] `.dockerignore` keeps `.env`, `.git`, tests and caches out of the image.
-- [ ] Compose services: the API, a Postgres database with a health check and a named volume, a
+- [x] `.dockerignore` keeps `.env`, `.git`, tests and caches out of the image.
+- [x] Compose services: the API, a Postgres database with a health check and a named volume, a
       one-off migration step that runs before the API starts, and a separate test database.
-- [ ] Database ports bound to `127.0.0.1` only.
-- [ ] `docker compose up --build` from a fresh clone gives a working API.
+- [x] Database ports bound to `127.0.0.1` only.
+- [x] `docker compose up --build` from a fresh clone gives a working API.
 
 ### Tests
-- [ ] Unit tests for schemas, the in-memory storage and services (no database).
-- [ ] API tests through the real app with an in-process HTTP client (httpx `ASGITransport`) and
+- [x] Unit tests for schemas, the in-memory storage and services (no database).
+- [x] API tests through the real app with an in-process HTTP client (httpx `ASGITransport`) and
       storage swapped via `app.dependency_overrides`.
-- [ ] Integration tests for the Postgres storage against the test database, each test rolled back.
-- [ ] Every endpoint: a happy-path test plus one test per documented error status.
-- [ ] Logging checked in at least one test (pytest `caplog`).
-- [ ] Line coverage at least 80% over the whole suite, enforced by the coverage configuration.
+- [x] Integration tests for the Postgres storage against the test database, each test rolled back.
+- [x] Every endpoint: a happy-path test plus one test per documented error status.
+- [x] Logging checked in at least one test (pytest `caplog`).
+- [x] Line coverage at least 80% over the whole suite, enforced by the coverage configuration.
 
 ### CI and pre-commit
-- [ ] `.pre-commit-config.yaml` with ruff (check and format), trailing whitespace and
+- [x] `.pre-commit-config.yaml` with ruff (check and format), trailing whitespace and
       end-of-file fixer; installed locally with `pre-commit install`.
-- [ ] GitHub Actions workflow on every push and every pull request.
-- [ ] Separate, named steps for linting, formatting and tests, so a failure shows which stage broke.
+- [x] GitHub Actions workflow on every push and every pull request.
+- [x] Separate, named steps for linting, formatting and tests, so a failure shows which stage broke.
       Reuse the pre-commit hooks in CI so local and CI checks cannot drift.
-- [ ] Tests in CI run against a Postgres service container; migrations are applied in CI.
-- [ ] Workflow token permissions limited to what it needs (`contents: read`).
+- [x] Tests in CI run against a Postgres service container; migrations are applied in CI.
+- [x] Workflow token permissions limited to what it needs (`contents: read`).
 
 ### Documentation
-- [ ] `README.md`: what the project is, requirements, Docker quick start, local development,
+- [x] `README.md`: what the project is, requirements, Docker quick start, local development,
       running tests, migrations, the endpoint table.
-- [ ] `ARCHITECTURE.md` sections 3 to 7, 8 (configuration and CI) and 9 filled in.
-- [ ] `ARCHITECTURE.md` changelog entry for week 1.
+- [x] `ARCHITECTURE.md` sections 3 to 7, 8 (configuration and CI) and 9 filled in.
+- [x] `ARCHITECTURE.md` changelog entry for week 1.
 
 ### Final check before submitting
-- [ ] Fresh clone, then `docker compose up --build`: all three endpoints work.
-- [ ] Tests, linting, formatting and type checks pass locally.
-- [ ] CI is green on `main`.
-- [ ] No `.env` or credentials anywhere in the git history.
+- [x] Fresh clone, then `docker compose up --build`: all three endpoints work.
+- [x] Tests, linting, formatting and type checks pass locally.
+- [x] CI is green on `main`.
+- [x] No `.env` or credentials anywhere in the git history.
 
 ## Submission
 
@@ -220,3 +230,127 @@ Show:
 - the three endpoints working in Swagger UI (`/docs`) or with curl, including one error case
   (404 or 422);
 - a green CI run on GitHub.
+
+# Week 2: VCF and ClinVar annotation files
+
+Let users upload VCF files into a project, parse every variant with its allele frequency into
+Postgres, keep the raw file in S3, and upload ClinVar annotation files that are validated and
+counted. Builds on the week 1 code. Walkthrough: [docs/week-02-implementation.md](docs/week-02-implementation.md).
+
+## Tasks
+
+### 5. VCF file management
+- `POST /projects/{project_id}/vcf/`: upload a VCF file
+  - validate the file extension (`.vcf` or `.vcf.gz`);
+  - parse and validate the VCF file;
+  - store file metadata in the database;
+  - extract all variants into the `variants` table;
+  - extract AF (allele frequency) from the INFO column and store it in the `variants` table.
+- `GET /projects/{project_id}/vcf/`: list the VCF files of a project
+- `GET /projects/{project_id}/vcf/{vcf_id}`: file metadata and its variants
+- `DELETE /projects/{project_id}/vcf/{vcf_id}`: delete the file and all its data
+
+### 6. Annotation file management
+- `POST /projects/{project_id}/annotation/`: upload a ClinVar annotation file
+  - tab-separated, in the full NCBI format (32 or more columns) or the simplified 12-column format;
+  - validate the format and count the valid entries;
+  - store the file and save its metadata.
+- `GET /projects/{project_id}/annotation/`: list the annotation files of a project
+- `DELETE /projects/{project_id}/annotation/{annotation_id}`: delete an annotation file
+
+Matching annotations to variants (the `annotations` table) is a later week.
+
+## New tables
+
+Full design in [ARCHITECTURE.md](ARCHITECTURE.md#6-data-model) section 6.
+
+| Table | Key columns | Rules |
+|---|---|---|
+| `vcf_files` | `vcf_file_id` UUID, `project_id` FK, `filename`, `s3_key`, `sample_count`, `variant_count`, `uploaded_at` | Deleted with its project; `s3_key` unique |
+| `variants` | `variant_id` bigint identity, `vcf_file_id` FK, `chrom`, `pos`, `vcf_id`, `ref`, `alt`, `qual`, `filter`, `af`, `info` jsonb | One row per ALT allele; deleted with its file |
+| `annotation_files` | `annotation_file_id` UUID, `project_id` FK, `filename`, `s3_key`, `column_format`, `entry_count`, `uploaded_at` | Deleted with its project; `s3_key` unique |
+
+## Week 2 milestone checklist
+
+Items marked **(decision)** go into the `ARCHITECTURE.md` decision log with their reason.
+
+### Database and migrations
+- [x] `vcf_files`, `variants`, `annotation_files` models and one Alembic migration, read by hand;
+      `upgrade head`, `check`, `downgrade base` all clean.
+- [x] **(decision)** `ON DELETE CASCADE` from projects to files to variants.
+- [x] **(decision)** `variants.variant_id` is `bigint`; no unique index on the allele columns,
+      because long indel alleles exceed the B-tree entry limit (the parser rejects duplicates).
+- [x] Shared file columns defined once (`ProjectFileMixin`); `alembic check` shows no drift.
+
+### Parsing
+- [x] Parsers are pure functions with no IO (`app/parsers/`), errors carry the line number.
+- [x] Extension check (`.vcf`, `.vcf.gz`; `.txt`, `.tsv`, optionally `.gz`); client filenames
+      never become storage paths.
+- [x] gzip and bgzip (multi-member) input; decompressed size capped at `MAX_UPLOAD_BYTES`
+      (gzip bomb guard).
+- [x] **(decision)** A multi-allelic VCF line becomes one row per ALT allele with its own AF; AF
+      must have one value per ALT.
+- [x] ClinVar full format (`AlleleID` first, at least 32 columns) and simplified 12-column format
+      detected; valid entries counted.
+- [x] **(decision)** Parsing runs in `asyncio.to_thread`, so CPU work does not block the event loop.
+
+### Storage (S3)
+- [x] `FileStorage` Protocol with `S3FileStorage` (boto3, in a worker thread) and
+      `InMemoryFileStorage`.
+- [x] **(decision)** File bytes in S3, metadata and variants in Postgres; S3 keys built from ids
+      only.
+- [x] **(decision)** Upload: rows flushed before the S3 write. Delete: S3 objects removed only
+      after the commit (`AfterCommit`, `DeleteAfterCommitStorage`); a failed S3 delete is logged
+      at ERROR.
+- [x] Deleting a project removes its S3 objects too.
+- [x] Local S3 in Docker Compose (moto server plus a one-off `s3-init` bucket step); no real
+      credentials anywhere.
+
+### API
+- [x] All seven endpoints with the documented status codes (201, 200, 204, 404, 413, 422).
+- [x] Upload returns 201 with a `Location` header built from the GET route name.
+- [x] **(decision)** Oversized bodies refused with 413 from `Content-Length` before the body is
+      read, plus an exact size check on the file itself.
+- [x] Variants returned in pages (`limit` 1 to 1000, `offset`).
+- [x] `s3_key` never leaves the server; file read schemas share `ProjectFileRead`.
+- [x] **(decision)** Domain errors form a hierarchy (`NotFoundError`, `ConflictError`,
+      `InvalidInputError`) mapped to HTTP status in one place (`app/api/errors.py`); routes have
+      no try/except.
+
+### Clean code
+- [x] No copy-paste between the two file types: generic `ProjectFileRepository[M]` (SQL and
+      in memory), `require_file` and `parse_upload` in `app/services/project_files.py`, one
+      `UploadDep` for reading uploads.
+- [x] Each file type keeps only what differs: its columns, its parser, its `add`.
+
+### Logging
+- [x] Uploads and deletes logged at INFO with ids; rejected uploads at WARNING with line number
+      and a fixed reason.
+- [x] Never logged: file content, uploaded filenames, credentials.
+
+### Tests
+- [x] Unit tests for both parsers, both services, the in-memory repositories and S3 storage
+      (moto in process).
+- [x] API tests for every new endpoint and every documented error status, including 413.
+- [x] Integration tests against Postgres: batched variant insert, jsonb, long alleles, cascades,
+      after-commit actions, full upload lifecycle.
+- [x] Every domain error maps to a status (`tests/unit/test_errors.py`).
+- [x] Test inputs built in code (`tests/samples.py`), no binary fixture files.
+- [x] Coverage at least 80% (about 99%, 193 tests).
+
+### Documentation
+- [x] `README.md`: scope, run instructions with local S3, endpoint table, curl example.
+- [x] `ARCHITECTURE.md`: data model, API table, decisions 9 to 20, week 2 changelog.
+- [x] `docs/week-02-implementation.md` walkthrough.
+
+### Final check before submitting
+- [x] `docker compose up --build` starts db, local S3, migrations and the API.
+- [x] `poetry run python scripts/check.py` passes.
+- [x] CI green on the pull request.
+
+## Demo
+
+- Upload a `.vcf.gz` file and show its variants (with AF) through `GET .../vcf/{vcf_id}`.
+- Upload a ClinVar file and show the counted entries.
+- One error case (422 on a bad file, or 404).
+- Delete the project and show its files are gone.

@@ -45,3 +45,6 @@ htmlcov/
 # Claude logs
 .claude/logs/
 ARTIFACT.md
+
+# Generated test datasets (scripts/generate_test_datasets.sh); public data, never committed
+/datasets/

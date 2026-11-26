@@ -23,7 +23,8 @@ flowchart LR
 | FastAPI app in Docker | REST API | **[done]** week 1 |
 | Postgres (local Docker) | Relational storage | **[done]** week 1 |
 | GitHub Actions: lint, format, type check, tests | Quality gate on every push and PR | **[done]** week 1 |
-| AWS S3 | Raw uploaded files, referenced by `s3_key` | **[planned]** |
+| S3 file storage (moto server locally) | Raw uploaded files, referenced by `s3_key` | **[done]** week 2 |
+| AWS S3 bucket | Production bucket (Terraform) | **[planned]** |
 | AWS RDS Postgres | Managed production database | **[planned]** |
 | ECR + ECS Fargate + ALB | Image registry, serverless containers, load balancer | **[planned]** |
 | GitHub Actions: build, push, deploy | Continuous delivery | **[planned]** |
@@ -52,20 +53,24 @@ flowchart TB
     R -. validates with .-> SC["schemas/<br/>Pydantic DTOs"]
     D["api/deps.py<br/>DI wiring"] -. builds .-> S
     S --> RP["repositories/<br/>storage access"]
-    S -. planned .-> ST["storage/s3.py<br/>file storage"]
+    S --> ST["storage/files.py<br/>file storage"]
+    S --> P["parsers/<br/>VCF, ClinVar (pure)"]
     RP --> M["models/<br/>SQLAlchemy tables"]
     M --> PG[(Postgres)]
-    ST -.-> S3[(S3)]
+    ST --> S3[(S3)]
 ```
 
 Dependencies point one way: routes to services to repositories. Nothing imports "upwards".
 
 | Package | Responsibility | Must not |
 |---|---|---|
-| `app/api/v1/routes/` | Map HTTP to service calls; domain errors to status codes | import `repositories/` or `db/` |
+| `app/api/v1/routes/` | Map HTTP to service calls | import `repositories/` or `db/` |
 | `app/api/v1/router.py` | Mount resource routers under `/api/v1` | contain handlers |
 | `app/api/deps.py` | Build services and their dependencies (the "beans") | contain logic |
+| `app/api/errors.py` | Map domain error base classes to HTTP status codes | know individual errors |
 | `app/services/` | Business rules and orchestration of one use case | import FastAPI |
+| `app/parsers/` | Pure functions: VCF and ClinVar validation and parsing | do IO, import other layers except `core/` |
+| `app/storage/` | File storage (S3) behind a Protocol | import FastAPI, hold business rules |
 | `app/repositories/` | Only code that reads/writes storage; DB errors to domain errors | import FastAPI, hold business rules |
 | `app/schemas/` | API contract (what clients send and receive) | know about storage |
 | `app/models/` | Table definitions | open sessions, run queries |
@@ -79,16 +84,22 @@ Dependencies point one way: routes to services to repositories. Nothing imports 
 |---|---|---|
 | Application Factory | `create_app(settings)` in `app/main.py` | Fresh, explicitly configured app per test; no import-time side effects |
 | Layered architecture | routes, services, repositories | Each change touches one layer |
-| Repository | `ProjectRepository` Protocol, `SqlAlchemyProjectRepository`, `InMemoryProjectRepository` | Storage swappable without touching services or routes |
-| Service Layer | `ProjectService` | One home for business rules and multi-step use cases |
+| Repository | `ProjectRepository`, `VcfFileRepository`, `AnnotationFileRepository` Protocols, each with a SQLAlchemy and an in-memory implementation; file repositories extend the generic `ProjectFileRepository[M]` | Storage swappable without touching services or routes |
+| Strategy (via Protocol) | `FileStorage`: `S3FileStorage`, `InMemoryFileStorage` | Services and tests never need a real S3 |
+| Service Layer | `ProjectService`, `VcfFileService`, `AnnotationFileService` | One home for multi-step use cases (validate, parse, insert rows, write S3) |
 | Dependency Injection | `Annotated[..., Depends(...)]` in `app/api/deps.py` | Routes receive ready services; tests override one provider |
-| Unit of Work | `get_session`: `session.begin()` per request | One transaction per request; commit or roll back as a whole |
-| DTO | `ProjectCreate`, `ProjectRead` | Clients cannot set server-owned fields (`project_id`, `created_at`, `completed_at`) |
+| Unit of Work | `get_session`: `session.begin()` per request, then `AfterCommit` actions | One transaction per request; S3 deletes run only after a successful commit |
+| Decorator | `DeleteAfterCommitStorage` wraps any `FileStorage` | Services stay unaware that deletes are deferred |
+| Template (generics) | `ProjectFileMixin`, `ProjectFileRepository[M]`, `require_file`, `parse_upload[T]` | Each file type writes only what differs: its columns, its parser, its `add` |
+| Exception handler | `register_error_handlers` in `app/api/errors.py`, `STATUS_BY_ERROR` | Routes have no try/except; every error body has the same shape |
+| DTO | `ProjectCreate`, `ProjectRead`, `ProjectFileRead` (base of `VcfFileRead`, `AnnotationFileRead`), `VcfFileDetail`; parser output `ParsedVariant` | Clients cannot set server-owned fields; `s3_key` never leaves the server |
 
 SOLID in practice:
 - Single responsibility: one job per layer (table above).
 - Open/closed: a new resource adds new files (schema, model, repository, service, route) and one
-  `include_router` line; existing resources do not change.
+  `include_router` line; existing resources do not change. A new file type also reuses the shared
+  file code (mixin, generic repository, `require_file`, `parse_upload`, `ProjectFileRead`), and a new
+  error subclasses a base in `core/exceptions.py`, so `api/errors.py` does not change.
 - Liskov substitution: both repositories satisfy the same Protocol; the service cannot tell them apart.
 - Interface segregation: the repository Protocol lists only the operations the service uses.
 - Dependency inversion: `ProjectService` depends on the `ProjectRepository` abstraction; only
@@ -101,13 +112,15 @@ app/
   main.py                    factory, lifespan, /health
   core/                      config.py, logging.py, exceptions.py
   db/                        base.py (Base + naming convention), session.py (engine, get_session)
-  models/                    one module per table; __init__.py imports all of them
-  schemas/                   one module per resource
-  repositories/              one module per aggregate
-  services/                  one module per resource / use case
-  storage/                   [planned] S3 client wrapper
-  parsers/                   [planned] VCF and annotation file parsers (pure functions)
-  api/deps.py
+  models/                    one module per table; project_file.py: ProjectFileMixin (shared file columns)
+  schemas/                   one module per resource; project_file.py: ProjectFileRead base
+  repositories/              one module per aggregate; project_file.py: generic ProjectFileRepository[M]
+  services/                  one module per resource; project_files.py: require_project, require_file, parse_upload
+  storage/                   files.py: FileStorage Protocol, S3 and in-memory implementations
+  parsers/                   text.py (filename, gunzip), vcf.py, clinvar.py: pure functions
+  api/uploads.py             Upload, read_upload: read an upload with the size limit (413)
+  api/errors.py              register_error_handlers: domain error base class to HTTP status
+  api/deps.py                services, storage, UploadDep
   api/v1/router.py
   api/v1/routes/             one module per resource
 alembic/versions/            one revision per schema change
@@ -142,8 +155,8 @@ sequenceDiagram
     alt name exists (uq_projects_name)
         DB-->>RP: IntegrityError
         RP-->>S: ProjectNameConflictError
-        S-->>R: re-raise (WARNING logged)
-        R-->>C: 409
+        S-->>F: re-raise (WARNING logged), session rolls back
+        F-->>C: 409 from the ConflictError handler (api/errors.py)
     end
     RP-->>S: ProjectModel
     S-->>R: ProjectModel (INFO "Project created project_id=...")
@@ -154,12 +167,13 @@ sequenceDiagram
 
 1. Validation runs before any of our code; bad input never reaches the service.
 2. One session and one transaction per request; any exception rolls everything back.
-3. Domain errors are plain Python exceptions; only routes translate them to HTTP.
+3. Domain errors are plain Python exceptions; `app/api/errors.py` maps each base class (not found, conflict, invalid input) to one status code.
 4. Output always goes through a response schema, never a raw ORM object.
 
 ## 6. Data model
 
-Target relational schema. Week 1 implements `projects` only.
+Target relational schema. Implemented: `projects` (week 1), `vcf_files`, `variants`, `annotation_files`
+(week 2). `annotations` is planned.
 
 ```mermaid
 erDiagram
@@ -182,20 +196,21 @@ erDiagram
         uuid project_id FK "on delete cascade"
         varchar(255) filename
         varchar(1024) s3_key UK
-        varchar(20) status "uploaded, parsing, parsed, failed"
-        int variant_count "nullable"
+        int sample_count
+        int variant_count
         timestamptz uploaded_at "default now()"
     }
     variants {
-        bigint variant_id PK
+        bigint variant_id PK "identity"
         uuid vcf_file_id FK "on delete cascade"
-        varchar(50) chrom
+        text chrom
         bigint pos "1-based, as in VCF"
-        varchar(100) vcf_id "VCF ID column, e.g. rs123, nullable"
+        text vcf_id "VCF ID column, e.g. rs123, nullable"
         text ref
-        text alt
+        text alt "one ALT allele per row"
         float qual "nullable"
-        varchar(100) filter "nullable"
+        text filter "nullable"
+        float af "allele frequency of this ALT, nullable"
         jsonb info
     }
     annotation_files {
@@ -203,7 +218,8 @@ erDiagram
         uuid project_id FK "on delete cascade"
         varchar(255) filename
         varchar(1024) s3_key UK
-        varchar(50) source "e.g. VEP, ClinVar"
+        varchar(20) column_format "full or simplified (ClinVar)"
+        int entry_count "valid entries"
         timestamptz uploaded_at "default now()"
     }
     annotations {
@@ -220,9 +236,9 @@ erDiagram
 | Table | Status | Constraints and indexes |
 |---|---|---|
 | `projects` | **[done]** | `pk_projects`, `uq_projects_name`; index on `created_at` once listing is paginated |
-| `vcf_files` | **[planned]** | FK to projects (cascade), unique `s3_key`, index on `project_id` |
-| `variants` | **[planned]** | FK to vcf_files (cascade); unique (`vcf_file_id`, `chrom`, `pos`, `ref`, `alt`); index (`chrom`, `pos`) for region queries |
-| `annotation_files` | **[planned]** | FK to projects (cascade), unique `s3_key` |
+| `vcf_files` | **[done]** | `fk_vcf_files_project_id_projects` (cascade), `uq_vcf_files_s3_key`, `ix_vcf_files_project_id` |
+| `variants` | **[done]** | FK to vcf_files (cascade); `ix_variants_vcf_file_id_variant_id` (paging, cascade); `ix_variants_chrom_pos` for region queries; no unique index on alleles (decision 16) |
+| `annotation_files` | **[done]** | FK to projects (cascade), `uq_annotation_files_s3_key`, `ix_annotation_files_project_id` |
 | `annotations` | **[planned]** | FKs to variants and annotation_files (cascade); unique (`variant_id`, `annotation_file_id`); index on `gene` |
 
 Design decisions:
@@ -232,13 +248,21 @@ Design decisions:
   sequential 8-byte key keeps the index compact. Resources clients address directly (projects,
   files) use UUIDs, which do not leak counts and can be generated anywhere.
 - Multi-allelic VCF lines are split into one row per ALT allele, so (`chrom`, `pos`, `ref`, `alt`)
-  identifies a variant within a file.
+  identifies a variant within a file. The parser enforces it; a unique index cannot, because long
+  indel alleles exceed the B-tree entry limit (about 2.7 KB).
+- `af` has its own column (one value per ALT allele) because variants are filtered by it.
+- Free text read from a VCF (`chrom`, `ref`, `alt`, ...) is `text`: no natural length limit, and
+  Postgres stores `text` and `varchar` the same way.
+- No `status` column on `vcf_files`: parsing is synchronous, so a row exists only for a parsed file.
 - `info` and `extra` are `jsonb`: VCF INFO fields and annotation columns differ by caller and tool.
   Fields that become filters (for example `gene`, `consequence`) get their own columns.
-- Status columns are `VARCHAR` validated by a Python enum, not native Postgres enums: adding a
-  value is then an ordinary migration.
-- Deleting a project cascades to its files, variants and annotations (`ON DELETE CASCADE`). The
-  matching S3 objects must be deleted by the service.
+- Enumerated values (`annotation_files.column_format`) are `VARCHAR` validated by a Python
+  `StrEnum`, not native Postgres enums: adding a value is then an ordinary migration.
+- Deleting a project cascades to its files, variants and annotations (`ON DELETE CASCADE`).
+  `ProjectService` deletes the S3 objects under `projects/{project_id}/` once the delete has
+  committed.
+- S3 keys are built from ids only: `projects/{project_id}/vcf/{vcf_file_id}.vcf[.gz]` and
+  `projects/{project_id}/annotation/{annotation_file_id}.txt[.gz]`.
 - Column naming: snake_case; plural table names; primary key `<entity>_id` (`project_id`,
   `vcf_file_id`, ...), so a foreign key column has the same name as the key it references; no table
   prefix on other columns (`projects.name`, not `project_name`); timestamps end in `_at` and are
@@ -255,13 +279,17 @@ Design decisions:
 | DELETE | `/api/v1/projects/{project_id}/` | 204 | 404, 422 bad UUID | **[done]** |
 | GET | `/api/v1/projects/{project_id}/` | 200 | 404 | **[planned]** |
 | POST | `/api/v1/projects/{project_id}/complete/` | 200, sets `completed_at` | 404, 409 already completed | **[planned]** |
-| POST | `/api/v1/projects/{project_id}/vcf-files/` | 202, multipart upload | 404, 413, 422 | **[planned]** |
-| GET | `/api/v1/projects/{project_id}/vcf-files/` | 200 | 404 | **[planned]** |
+| POST | `/api/v1/projects/{project_id}/vcf/` | 201 `VcfFileRead` + `Location`, multipart `file` | 404, 413, 422 | **[done]** |
+| GET | `/api/v1/projects/{project_id}/vcf/` | 200 `list[VcfFileRead]` | 404 | **[done]** |
+| GET | `/api/v1/projects/{project_id}/vcf/{vcf_id}?limit=&offset=` | 200 `VcfFileDetail` (metadata + variant page) | 404, 422 | **[done]** |
+| DELETE | `/api/v1/projects/{project_id}/vcf/{vcf_id}` | 204 | 404 | **[done]** |
+| POST | `/api/v1/projects/{project_id}/annotation/` | 201 `AnnotationFileRead`, multipart `file` | 404, 413, 422 | **[done]** |
+| GET | `/api/v1/projects/{project_id}/annotation/` | 200 `list[AnnotationFileRead]` | 404 | **[done]** |
+| DELETE | `/api/v1/projects/{project_id}/annotation/{annotation_id}` | 204 | 404 | **[done]** |
 | GET | `/api/v1/vcf-files/{vcf_file_id}/variants/?chrom=&start=&end=&gene=&limit=&offset=` | 200 page | 404, 422 | **[planned]** |
-| POST | `/api/v1/projects/{project_id}/annotation-files/` | 202 | 404, 422 | **[planned]** |
 | GET | `/api/v1/projects/{project_id}/summary/` | 200 counts by chrom, consequence, significance | 404 | **[planned]** |
 
-Conventions: plural nouns, trailing slash on every path (as specified), `/api/v1` version prefix,
+Conventions: paths exactly as specified (collections end with a slash, week 2 item paths do not), `/api/v1` version prefix,
 201 for create, 204 for delete, 404 for unknown ids, 409 for conflicts, 422 left to Pydantic.
 Lists will get `limit`/`offset` pagination once they can grow large (variants first).
 
@@ -276,15 +304,21 @@ definition plus Secrets Manager in AWS.
 | `DATABASE_URL` | yes | | `postgresql+asyncpg://...`; held as `SecretStr` |
 | `LOG_LEVEL` | no | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `TEST_DATABASE_URL` | tests only | `...localhost:5433/gva_test` | Integration tests |
+| `S3_BUCKET` | no | `gva-files` | Bucket for uploaded files |
+| `S3_ENDPOINT_URL` | no | none (AWS) | Local S3: `http://localhost:9000`, in Compose `http://s3:5000` |
+| `AWS_REGION` | no | `us-east-1` | Read as `aws_region` |
+| `MAX_UPLOAD_BYTES` | no | 52428800 (50 MB) | Upload limit (413); also caps `.gz` content after decompression |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | local only | | Read by boto3, never by `Settings`; fake values for moto; ECS uses the task role |
 
 ### Logging
 - stdlib `logging`, configured once in the lifespan (`configure_logging`), output to stdout
   (collected by Docker and, later, CloudWatch).
 - `log_requests` middleware: one line per request with method, path, status, duration; level INFO
   for 2xx/3xx, WARNING for 4xx, ERROR for 5xx.
-- Services log state changes at INFO and rejected requests at WARNING; repositories log row-level
-  detail at DEBUG.
-- Never logged: request bodies, query strings, `DATABASE_URL`, credentials, VCF content.
+- Services log state changes at INFO and rejected requests at WARNING; repositories log at DEBUG
+  only what the service log does not say (row counts, variant batches).
+- Never logged: request bodies, query strings, `DATABASE_URL`, credentials, file content,
+  uploaded filenames. Parse errors log the line number and a fixed reason only.
 - **[planned]** JSON log format and a request id for CloudWatch Logs Insights.
 
 ### Migrations
@@ -300,7 +334,8 @@ definition plus Secrets Manager in AWS.
 | `tests/api/` | HTTP contract through the real app | in memory (dependency override) |
 | `tests/integration/` | SQL repository, full stack with lifespan | Postgres `test_db`, rolled back per test |
 
-Line coverage gate: 80% (`[tool.coverage.report] fail_under`), currently about 98%.
+Line coverage gate: 80% (`[tool.coverage.report] fail_under`), currently about 99% (193 tests).
+S3 code is tested against moto in process; API and integration tests use `InMemoryFileStorage`.
 Tests follow FIRST and Arrange, Act, Assert. Every endpoint has a happy-path test plus one test per
 documented error status.
 
@@ -326,6 +361,18 @@ documented error status.
 | 6 | Uniqueness enforced by DB constraints, mapped to 409 (`projects.name` now, `s3_key` later) | No race between "check" and "insert" |
 | 7 | Settings injected into `create_app` | Tests never depend on `.env`; no import-time side effects |
 | 8 | Python 3.15, the latest stable release | Same version locally, in Docker and in CI |
+| 9 | Parse uploads synchronously, 201, no status column | KISS for files up to 50 MB; a queue can come when needed |
+| 10 | Upload: flush rows, then write S3. Delete: delete rows, commit, then delete S3 (`AfterCommit`) | No row ever points at a missing file; the only leftover case is a harmless orphaned object, logged at ERROR |
+| 11 | One `variants` row per ALT allele with its own `af` | (`chrom`, `pos`, `ref`, `alt`) identifies a variant; AF filters are plain SQL |
+| 12 | Hand-written VCF and ClinVar parsers | No C extensions; explicit, tested rules with line numbers in errors |
+| 13 | ClinVar full format = `AlleleID` first, at least 32 columns, required columns present | NCBI appends columns over time (40 in 2026); the simplified 12-column format is exact |
+| 14 | Local S3 is moto server | MinIO stopped publishing Docker images; moto is also the test fake |
+| 15 | Decompression capped at `MAX_UPLOAD_BYTES`, all gzip members read | Gzip bomb protection; bgzip files have many members |
+| 16 | No unique constraint on (`vcf_file_id`, `chrom`, `pos`, `ref`, `alt`) | Long indel alleles exceed the B-tree entry limit; the parser rejects duplicates |
+| 17 | Parsing runs in `asyncio.to_thread` | CPU work must not block the event loop |
+| 18 | `Content-Length` checked in a middleware before the body is read | Starlette spools multipart bodies to disk before the route runs |
+| 19 | Domain errors subclass `NotFoundError`, `ConflictError` or `InvalidInputError`; one handler per base class | Routes stay thin; a new error needs no HTTP code; `FileStorageError` stays a 500 |
+| 20 | File models share `ProjectFileMixin`; `file_id` is a `synonym` of each primary key | Generic repository code without renaming columns, so no migration and no API change |
 
 ## 10. Changelog by week
 
@@ -334,3 +381,11 @@ Project skeleton, Poetry, Docker and Compose (db, test_db, migrate, api), settin
 `projects` table (`project_id`, `name`, `lead_scientist`, `description`, `created_at`,
 `completed_at`) and first migration, `POST`/`GET`/`DELETE` projects endpoints, unit/API/integration
 tests (coverage about 98%), pre-commit, GitHub Actions CI.
+
+### Week 2
+`vcf_files`, `variants`, `annotation_files` tables and migration; VCF parser (multi-allelic split,
+AF per allele, gzip/bgzip) and ClinVar parser (full and simplified formats); S3 file storage with
+moto server in Compose; VCF upload/list/get/delete and annotation upload/list/delete endpoints;
+project and file deletes remove S3 objects after the commit. Refactor: domain error hierarchy
+mapped in one handler (`api/errors.py`), `UploadDep`, shared file code (`ProjectFileMixin`,
+`ProjectFileRepository[M]`, `services/project_files.py`, `ProjectFileRead`); 193 tests, coverage about 99%.

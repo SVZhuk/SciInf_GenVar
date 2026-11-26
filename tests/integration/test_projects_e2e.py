@@ -3,32 +3,23 @@
 from uuid import uuid4
 
 import pytest
-from httpx import ASGITransport, AsyncClient
-
-from app.core.config import Settings
-from app.main import create_app
+from httpx import AsyncClient
 
 pytestmark = pytest.mark.integration
 
 URL = "/api/v1/projects/"
 
 
-@pytest.mark.usefixtures("engine")
-async def test_project_lifecycle(settings: Settings) -> None:
-    app = create_app(settings)
-    transport = ASGITransport(app=app)
+async def test_project_lifecycle(e2e_client: AsyncClient) -> None:
     payload = {"name": f"e2e-{uuid4()}", "lead_scientist": "Rosalind Franklin"}
-    async with (
-        app.router.lifespan_context(app),
-        AsyncClient(transport=transport, base_url="http://test") as client,
-    ):
-        created = await client.post(URL, json=payload)
-        assert created.status_code == 201
-        assert (await client.post(URL, json=payload)).status_code == 409
-        project = created.json()
-        assert project in (await client.get(URL)).json()
 
-        deleted = await client.delete(f"{URL}{project['project_id']}/")
+    created = await e2e_client.post(URL, json=payload)
+    assert created.status_code == 201
+    assert (await e2e_client.post(URL, json=payload)).status_code == 409
+    project = created.json()
+    assert project in (await e2e_client.get(URL)).json()
 
-        assert deleted.status_code == 204
-        assert project not in (await client.get(URL)).json()
+    deleted = await e2e_client.delete(f"{URL}{project['project_id']}/")
+
+    assert deleted.status_code == 204
+    assert project not in (await e2e_client.get(URL)).json()
