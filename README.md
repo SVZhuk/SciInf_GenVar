@@ -81,8 +81,13 @@ Rebuild the image (`docker compose up --build`) after adding a migration.
 Example upload:
 
 ```bash
-curl -F file=@calls.vcf.gz http://127.0.0.1:8000/api/v1/projects/<project_id>/vcf/
+curl -F file=@datasets/calls.vcf.gz http://127.0.0.1:8000/api/v1/projects/<project_id>/vcf/
 ```
+
+`scripts/generate_test_datasets.sh` fills the git-ignored `datasets/` folder with files to try:
+a small synthetic VCF, slices of the real ClinVar summary (full and simplified formats), the
+ClinVar VCF (no AF key), a 1000 Genomes chr22 region with AF (needs `bcftools`), and files under
+`datasets/rejected/` that must return 422. Existing files are kept; `FORCE=1` downloads again.
 
 ## Quality checks
 
