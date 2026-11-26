@@ -704,6 +704,10 @@ flowchart LR
 - `s3` runs moto in server mode. It keeps objects in memory: they are gone after
   `docker compose down`, while Postgres keeps its rows in a volume. Deleting such a file later
   still works, because an S3 delete of a missing key succeeds.
+- `s3` starts through `scripts/moto_server.py` (mounted read-only) instead of the image's
+  `moto_server`: `AccessLogRequestHandler` replaces the werkzeug access line with the API format,
+  `GET /moto-api/ -> 200 (0.5 ms)` under logger `moto.request`, without query strings, 4xx at
+  WARNING and 5xx at ERROR.
 - `s3-init` is a one-off container that creates the bucket, like `migrate` for the schema; `api`
   waits until both have exited successfully.
 - `x-local-s3-credentials` holds fake keys (moto accepts any) and is merged only into `api` and
