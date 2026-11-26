@@ -78,16 +78,39 @@ Rebuild the image (`docker compose up --build`) after adding a migration.
 | DELETE | /api/v1/projects/{project_id}/annotation/{annotation_id} | 204 | 404 |
 | GET | /health | 200 | |
 
-Example upload:
+Example upload (files from [Test data](#test-data)):
 
 ```bash
 curl -F file=@datasets/calls.vcf.gz http://127.0.0.1:8000/api/v1/projects/<project_id>/vcf/
 ```
 
-`scripts/generate_test_datasets.sh` fills the git-ignored `datasets/` folder with files to try:
-a small synthetic VCF, slices of the real ClinVar summary (full and simplified formats), the
-ClinVar VCF (no AF key), a 1000 Genomes chr22 region with AF (needs `bcftools`), and files under
-`datasets/rejected/` that must return 422. Existing files are kept; `FORCE=1` downloads again.
+## Test data
+
+Automated tests build their inputs in code (`tests/samples.py`). For trying the API by hand,
+`scripts/generate_test_datasets.sh` fills the git-ignored `datasets/` folder with small synthetic
+files, slices of real public releases (ClinVar, 1000 Genomes) and files the API must reject.
+Never commit them.
+
+```bash
+scripts/generate_test_datasets.sh              # into datasets/
+scripts/generate_test_datasets.sh /tmp/gva     # or any other folder
+FORCE=1 scripts/generate_test_datasets.sh      # download again; otherwise existing files are kept
+```
+
+Needs `curl`, `gzip` and `awk`; the 1000 Genomes slice also needs `bcftools`
+(`sudo apt install bcftools`) and is skipped without it. Only the first lines or one region of
+each release are downloaded, a few MB in all.
+
+| File | Endpoint | Expected |
+|---|---|---|
+| `calls.vcf`, `calls.vcf.gz` | vcf | 201, 3 variants (one multi-allelic line), AF on each |
+| `1kg_chr22_small.vcf.gz` | vcf | 201, 1000 Genomes chr22 region (GRCh37) with AF per ALT allele |
+| `clinvar_head.vcf.gz` | vcf | 201, ClinVar VCF without an AF key, so `af` is null on every variant |
+| `variant_summary_head.txt` | annotation | 201, full format, first 20,000 rows; some rows lack coordinates and count as invalid |
+| `clinvar_simplified.tsv` | annotation | 201, the same rows in the simplified 12-column format |
+| `rejected/calls.txt` | vcf | 422, wrong extension |
+| `rejected/fake.vcf.gz` | vcf | 422, `.gz` name but not gzip |
+| `rejected/bad_af.vcf` | vcf | 422, one AF value for two ALT alleles |
 
 ## Quality checks
 

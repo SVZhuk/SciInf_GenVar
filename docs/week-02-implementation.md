@@ -714,15 +714,51 @@ flowchart LR
   `s3-init`; `migrate` never talks to S3 and does not get them. On AWS no keys exist at all: the
   ECS task role provides temporary credentials.
 
-Start the full stack and try it (sample files are built in `tests/samples.py`, or use your own):
+### Test data for trying it by hand
+
+Tests never read files from disk (step 12). For manual tries, `scripts/generate_test_datasets.sh`
+builds a set of files into the git-ignored `datasets/` folder (also in `.dockerignore`), so real
+data never reaches the repository or the image.
+
+```mermaid
+flowchart LR
+    S["synthetic<br/>(same records as tests/samples.py)"] --> C["calls.vcf<br/>calls.vcf.gz"]
+    C --> RJ["rejected/<br/>calls.txt, fake.vcf.gz, bad_af.vcf"]
+    NS["NCBI variant_summary.txt.gz"] -->|"curl, gunzip, head"| VS["variant_summary_head.txt<br/>full format"]
+    VS -->|"awk, columns by name"| CS["clinvar_simplified.tsv<br/>12 columns"]
+    NV["NCBI clinvar.vcf.gz"] -->|"curl, gunzip, head, gzip"| CV["clinvar_head.vcf.gz<br/>no AF key"]
+    KG["1000 Genomes chr22"] -->|"bcftools view -G -r, norm -d exact"| K["1kg_chr22_small.vcf.gz<br/>AF per allele"]
+```
+
+| Part of the script | What it does and why |
+|---|---|
+| `needed` | Skips a file that already exists, so a rerun does not download again; `FORCE=1` rebuilds |
+| `head_of_remote_gz` | Streams a remote gzip and keeps the first N lines, without downloading the whole release (several GB unpacked). `head` closes the pipe early, so curl and gunzip die of SIGPIPE: pipefail is turned off for that pipeline and the line count is checked instead. A moved URL fails with a clear message |
+| awk step | Picks the 12 simplified columns from the full file by header name, not position, because NCBI appends columns over time (step 5) |
+| bcftools step | `-r` with the remote index downloads only the region; `-G` drops the 2,504 sample columns; `norm -d exact` removes exact duplicates, which the parser rejects (step 4). Skipped with a message when `bcftools` is not installed |
+| `rejected/` | One file per 422 case: wrong extension, fake gzip, AF count mismatch |
+
+What each file exercises:
+- `variant_summary_head.txt` and `clinvar_simplified.tsv` give the same counts (about 19,700
+  valid and 300 invalid rows in a 2026 release): the two formats of the same data.
+- `clinvar_head.vcf.gz` has `AF_ESP`, `AF_EXAC`, `AF_TGP` in INFO but no `AF`, so every variant
+  is stored with `af` null: the "missing AF" case.
+- `1kg_chr22_small.vcf.gz` has multi-allelic sites with one AF per allele.
+
+All of it is public, consented data. If NCBI or the 1000 Genomes FTP moves a file, browse its
+parent folder and update the URL constants at the top of the script.
+
+Start the full stack and try it with these files:
 
 ```bash
 docker compose up --build -d --wait api
 P=$(curl -s -X POST http://127.0.0.1:8000/api/v1/projects/ -H 'content-type: application/json' \
   -d '{"name": "BRCA cohort", "lead_scientist": "Rosalind Franklin"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["project_id"])')
-curl -s -i -F file=@calls.vcf.gz http://127.0.0.1:8000/api/v1/projects/$P/vcf/   # 201 + Location
+curl -s -i -F file=@datasets/calls.vcf.gz http://127.0.0.1:8000/api/v1/projects/$P/vcf/   # 201 + Location
+curl -s -F file=@datasets/clinvar_head.vcf.gz http://127.0.0.1:8000/api/v1/projects/$P/vcf/  # af null
 curl -s "http://127.0.0.1:8000/api/v1/projects/$P/vcf/"
-curl -s -F file=@variant_summary.txt http://127.0.0.1:8000/api/v1/projects/$P/annotation/
+curl -s -F file=@datasets/variant_summary_head.txt http://127.0.0.1:8000/api/v1/projects/$P/annotation/
+curl -s -F file=@datasets/rejected/bad_af.vcf http://127.0.0.1:8000/api/v1/projects/$P/vcf/   # 422
 curl -s "http://127.0.0.1:9000/gva-files?list-type=2"     # the objects in local S3
 curl -s -o /dev/null -w "%{http_code}\n" -X DELETE http://127.0.0.1:8000/api/v1/projects/$P/  # 204
 docker compose down
@@ -800,7 +836,9 @@ process, and the integration tests replace S3 with the in-memory storage.
 ## Step 13. README.md
 
 Update the scope line, the branch table, the run instructions (Compose now starts `s3` and
-`s3-init`) and the API table (the seven new endpoints from step 10).
+`s3-init`) and the API table (the seven new endpoints from step 10). Add a "Test data" section: how
+to run `scripts/generate_test_datasets.sh` and a table of each file with its endpoint and expected
+status.
 
 ## Final verification
 
@@ -835,3 +873,6 @@ git push                                                          # watch CI go 
 | Editor warning `asynccontextmanager` is deprecated | Function annotated `-> AsyncIterator[...]`; the decorator needs `athrow` and `aclose`, which only an async generator has | Annotate `-> AsyncGenerator[...]` (`main.py`, `session.py`) |
 | 500 `index row size exceeds btree maximum` | A unique index over `ref`/`alt` | Do not index unbounded allele text (step 6) |
 | S3 objects still there after a delete, ERROR `Orphaned file after commit` | S3 refused the delete after the commit | Fix bucket permissions; delete the logged keys |
+| `skip 1kg_chr22_small.vcf.gz (bcftools not installed ...)` | `bcftools` missing | `sudo apt install bcftools`, rerun the script |
+| `error could not read <url>` from the dataset script | NCBI or 1000 Genomes moved the file, or no network | Browse the parent folder, update the URL constant |
+| 422 duplicate variant for a bcftools slice | Duplicates left in by a hand-made slice | `bcftools norm -d exact` (the script does it) |
